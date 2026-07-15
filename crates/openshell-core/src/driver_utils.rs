@@ -160,3 +160,80 @@ pub fn supervisor_image_tag(image: &str) -> Option<&str> {
 pub fn supervisor_image_should_refresh(image: &str) -> bool {
     matches!(supervisor_image_tag(image), Some("dev" | "latest"))
 }
+
+// ---------------------------------------------------------------------------
+// Image name helpers
+// ---------------------------------------------------------------------------
+
+/// Normalize a container image reference into a canonical form.
+///
+/// The following transformations are applied in order:
+/// 1. Leading and trailing whitespace is trimmed.
+/// 2. The entire string is lowercased.
+/// 3. Consecutive slashes are collapsed into a single slash.
+/// 4. Any trailing slash is stripped.
+///
+/// # Examples
+/// ```
+/// use openshell_core::driver_utils::sanitize_image_name;
+///
+/// assert_eq!(sanitize_image_name("ubuntu:22.04"), "ubuntu:22.04");
+/// assert_eq!(sanitize_image_name("  ubuntu:22.04  "), "ubuntu:22.04");
+/// assert_eq!(sanitize_image_name("Ubuntu:22.04"), "ubuntu:22.04");
+/// assert_eq!(sanitize_image_name("ghcr.io//org/image:latest"), "ghcr.io/org/image:latest");
+/// assert_eq!(sanitize_image_name("ghcr.io/org/image/"), "ghcr.io/org/image");
+/// ```
+pub fn sanitize_image_name(image: &str) -> String {
+    let trimmed = image.trim().to_lowercase();
+    // Collapse consecutive slashes into one.
+    let mut result = String::with_capacity(trimmed.len());
+    let mut prev_slash = false;
+    for ch in trimmed.chars() {
+        if ch == '/' {
+            if !prev_slash {
+                result.push(ch);
+            }
+            prev_slash = true;
+        } else {
+            result.push(ch);
+            prev_slash = false;
+        }
+    }
+    // Strip trailing slash.
+    if result.ends_with('/') {
+        result.pop();
+    }
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sanitize_image_name() {
+        // Normal image name passes through unchanged.
+        assert_eq!(sanitize_image_name("ubuntu:22.04"), "ubuntu:22.04");
+
+        // Leading and trailing whitespace is trimmed.
+        assert_eq!(sanitize_image_name("  ubuntu:22.04  "), "ubuntu:22.04");
+
+        // Uppercase letters are lowercased.
+        assert_eq!(
+            sanitize_image_name("GhCr.Io/Org/Image:Latest"),
+            "ghcr.io/org/image:latest"
+        );
+
+        // Consecutive (double) slashes are collapsed into a single slash.
+        assert_eq!(
+            sanitize_image_name("ghcr.io//org/image:latest"),
+            "ghcr.io/org/image:latest"
+        );
+
+        // Trailing slash is stripped.
+        assert_eq!(
+            sanitize_image_name("ghcr.io/org/image/"),
+            "ghcr.io/org/image"
+        );
+    }
+}
