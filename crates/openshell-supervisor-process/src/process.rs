@@ -1167,13 +1167,20 @@ fn rewrite_group_at(path: &Path, gid: &str) -> Result<()> {
 ///
 /// Uses `walkdir` to iterate over every entry under `root` and calls
 /// `nix::unistd::chown` on each one. Symlinks are not followed
-/// (`follow_links(false)`) — the symlink inode itself is chowned, which is
-/// harmless and prevents privilege escalation via malicious container images.
+/// (`follow_links(false)`) — the symlink inode itself is chowned via
+/// `lchown`, which is harmless and prevents privilege escalation via
+/// malicious container images.
 ///
-/// Read-only sub-mounts (EROFS) are skipped with a warning so the walk
-/// continues rather than aborting. Any other error is propagated immediately.
-/// If `root` itself is on a read-only filesystem the error is propagated
-/// because the sandbox home directory cannot be used.
+/// Read-only sub-mount entries that return `EROFS` or `EPERM` are skipped
+/// with a warning so the walk continues rather than aborting. (`EPERM` can
+/// occur on read-only bind-mounts and overlayfs entries even when
+/// `follow_links(false)` causes `lchown` to be used.) Any other error is
+/// propagated immediately.
+///
+/// Note: `root` itself is yielded as the first `WalkDir` entry, so if the
+/// root directory is on a read-only filesystem it will be silently skipped
+/// rather than propagated. Callers that require the root to be writable
+/// should perform an explicit pre-check before calling this function.
 ///
 /// The TOCTOU window is not exploitable because no untrusted process is
 /// running yet.
@@ -1202,14 +1209,14 @@ fn chown_sandbox_home(root: &Path, uid: Option<Uid>, gid: Option<Gid>) -> Result
             Ok(()) => {
                 debug!(path = %path.display(), "chown succeeded");
             }
-            Err(Errno::EROFS) => {
-                // Read-only filesystem: this sub-mount cannot be chowned.
+            Err(Errno::EROFS) | Err(Errno::EPERM) => {
+                // Read-only filesystem or permission denied on a read-only
+                // bind-mount / overlayfs entry: this path cannot be chowned.
                 // Log a warning and continue walking — other writable paths
-                // should still be chowned correctly. If the root itself is
-                // read-only the caller will catch subsequent failures.
+                // should still be chowned correctly.
                 warn!(
                     path = %path.display(),
-                    "Skipping read-only path during sandbox home chown (EROFS)"
+                    "Skipping read-only path during sandbox home chown (EROFS/EPERM)"
                 );
             }
             Err(err) => {
@@ -2476,3 +2483,4 @@ mod tests {
         );
     }
 }
+
