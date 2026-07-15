@@ -169,9 +169,11 @@ pub fn supervisor_image_should_refresh(image: &str) -> bool {
 ///
 /// The following transformations are applied in order:
 /// 1. Leading and trailing whitespace is trimmed.
-/// 2. The entire string is lowercased.
-/// 3. Consecutive slashes are collapsed into a single slash.
-/// 4. Any trailing slash is stripped.
+/// 2. Only the registry/repository portion (before the first `:`) is
+///    lowercased; the tag and digest are left as-is to preserve
+///    case-sensitive values such as digest hex strings.
+/// 3. Consecutive slashes are collapsed into a single slash, and any
+///    leading or trailing slash is stripped.
 ///
 /// # Examples
 /// ```
@@ -182,28 +184,39 @@ pub fn supervisor_image_should_refresh(image: &str) -> bool {
 /// assert_eq!(sanitize_image_name("Ubuntu:22.04"), "ubuntu:22.04");
 /// assert_eq!(sanitize_image_name("ghcr.io//org/image:latest"), "ghcr.io/org/image:latest");
 /// assert_eq!(sanitize_image_name("ghcr.io/org/image/"), "ghcr.io/org/image");
+/// assert_eq!(sanitize_image_name(""), "");
+/// assert_eq!(sanitize_image_name("/"), "");
 /// ```
 pub fn sanitize_image_name(image: &str) -> String {
-    let trimmed = image.trim().to_lowercase();
-    // Collapse consecutive slashes into one.
-    let mut result = String::with_capacity(trimmed.len());
-    let mut prev_slash = false;
-    for ch in trimmed.chars() {
-        if ch == '/' {
-            if !prev_slash {
-                result.push(ch);
-            }
-            prev_slash = true;
-        } else {
-            result.push(ch);
-            prev_slash = false;
-        }
-    }
-    // Strip trailing slash.
-    if result.ends_with('/') {
-        result.pop();
-    }
-    result
+    let trimmed = image.trim();
+
+    // Split off the tag/digest suffix so we only lowercase the name portion.
+    // A digest uses '@' and a tag uses ':' after the last path component.
+    // We find the first ':' or '@' that appears after any '/' segments.
+    let (name_part, suffix) = if let Some(at_pos) = trimmed.find('@') {
+        // Digest reference: everything from '@' onward is case-sensitive.
+        (&trimmed[..at_pos], &trimmed[at_pos..])
+    } else if let Some(colon_pos) = trimmed.rfind('/').map_or_else(
+        || trimmed.find(':'),
+        |last_slash| trimmed[last_slash..].find(':').map(|p| last_slash + p),
+    ) {
+        // Tag reference: everything from ':' onward is case-sensitive.
+        (&trimmed[..colon_pos], &trimmed[colon_pos..])
+    } else {
+        // No tag or digest — the whole string is the name.
+        (trimmed, "")
+    };
+
+    // Lowercase only the registry/name segment, then collapse consecutive
+    // slashes using an idiomatic split/filter/join.
+    let normalized_name = name_part
+        .to_lowercase()
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("/");
+
+    format!("{}{}", normalized_name, suffix)
 }
 
 #[cfg(test)]
@@ -218,10 +231,10 @@ mod tests {
         // Leading and trailing whitespace is trimmed.
         assert_eq!(sanitize_image_name("  ubuntu:22.04  "), "ubuntu:22.04");
 
-        // Uppercase letters are lowercased.
+        // Uppercase letters in registry/name are lowercased.
         assert_eq!(
             sanitize_image_name("GhCr.Io/Org/Image:Latest"),
-            "ghcr.io/org/image:latest"
+            "ghcr.io/org/image:Latest"
         );
 
         // Consecutive (double) slashes are collapsed into a single slash.
@@ -235,5 +248,18 @@ mod tests {
             sanitize_image_name("ghcr.io/org/image/"),
             "ghcr.io/org/image"
         );
+
+        // Digest values are preserved as-is (case-sensitive hex).
+        assert_eq!(
+            sanitize_image_name("MyRepo/Image@sha256:AbCdEf"),
+            "myrepo/image@sha256:AbCdEf"
+        );
+
+        // Empty string returns empty string.
+        assert_eq!(sanitize_image_name(""), "");
+
+        // Slash-only inputs collapse to empty string.
+        assert_eq!(sanitize_image_name("/"), "");
+        assert_eq!(sanitize_image_name("//"), "");
     }
 }
