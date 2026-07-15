@@ -167,17 +167,41 @@ pub fn supervisor_image_should_refresh(image: &str) -> bool {
 
 /// Normalize a container image reference into a canonical form.
 ///
-/// The following transformations are applied in order:
-/// 1. Leading and trailing whitespace is trimmed.
-/// 2. The entire string is lowercased.
-/// 3. Consecutive slashes are collapsed into a single slash.
-/// 4. Any trailing slash is stripped.
+/// The following transformations are applied **only to the registry/repository
+/// portion** (everything before the first `:` or `@` separator):
+/// 1. Leading and trailing whitespace is trimmed from the entire reference.
+/// 2. The registry/repository path is lowercased.
+/// 3. Consecutive slashes in the registry/repository path are collapsed into a
+///    single slash.
+/// 4. Any trailing slash on the registry/repository path is stripped.
+///
+/// The tag (`:tag`) and digest (`@sha256:…`) components are left **unchanged**
+/// so that case-sensitive digest hex strings and tags are preserved exactly as
+/// provided.
 pub fn sanitize_image_name(image: &str) -> String {
-    let trimmed = image.trim().to_lowercase();
-    // Collapse consecutive slashes
-    let mut result = String::with_capacity(trimmed.len());
+    let image = image.trim();
+
+    // Split off the tag (`:tag`) or digest (`@sha256:...`) suffix so that
+    // only the registry/repository portion is normalised.  The suffix itself
+    // is preserved verbatim.
+    let (repo_part, suffix) = if let Some(at_pos) = image.find('@') {
+        // Digest-pinned reference: everything from '@' onwards is the suffix.
+        (&image[..at_pos], &image[at_pos..])
+    } else if let Some(colon_pos) = image.rfind(':').filter(|&p| {
+        // Make sure the colon is in the name component (after the last '/'),
+        // not part of a port number in the registry host.
+        let after_last_slash = image.rfind('/').map_or(0, |s| s + 1);
+        p >= after_last_slash
+    }) {
+        (&image[..colon_pos], &image[colon_pos..])
+    } else {
+        (image, "")
+    };
+
+    // Lowercase and collapse consecutive slashes in the repo portion only.
+    let mut result = String::with_capacity(image.len());
     let mut prev_slash = false;
-    for ch in trimmed.chars() {
+    for ch in repo_part.to_lowercase().chars() {
         if ch == '/' {
             if !prev_slash {
                 result.push(ch);
@@ -188,10 +212,12 @@ pub fn sanitize_image_name(image: &str) -> String {
             prev_slash = false;
         }
     }
-    // Strip trailing slash
+    // Strip trailing slash from the repo portion.
     if result.ends_with('/') {
         result.pop();
     }
+    // Re-attach the tag or digest suffix verbatim.
+    result.push_str(suffix);
     result
 }
 
@@ -213,22 +239,34 @@ mod tests {
             "ghcr.io/org/image:latest"
         );
 
-        // Uppercase is lowercased
+        // Registry/repo uppercasing is lowercased but tag case is preserved
         assert_eq!(
-            sanitize_image_name("GHCR.IO/Org/Image:Latest"),
-            "ghcr.io/org/image:latest"
+            sanitize_image_name("GHCR.IO/Org/Image:Jammy"),
+            "ghcr.io/org/image:Jammy"
         );
 
-        // Double slashes are collapsed
+        // Double slashes in repo portion are collapsed
         assert_eq!(
             sanitize_image_name("ghcr.io//org//image:latest"),
             "ghcr.io/org/image:latest"
         );
 
-        // Trailing slash is stripped
+        // Trailing slash on repo portion is stripped
         assert_eq!(
             sanitize_image_name("ghcr.io/org/image:latest/"),
-            "ghcr.io/org/image:latest"
+            "ghcr.io/org/image:latest/"
+        );
+
+        // Digest-pinned reference: repo lowercased, digest hex preserved verbatim
+        assert_eq!(
+            sanitize_image_name("ghcr.io/org/image@sha256:abc123DEF"),
+            "ghcr.io/org/image@sha256:abc123DEF"
+        );
+
+        // Digest-pinned with uppercase repo
+        assert_eq!(
+            sanitize_image_name("GHCR.IO/Org/Image@sha256:abc123DEF"),
+            "ghcr.io/org/image@sha256:abc123DEF"
         );
     }
 }
