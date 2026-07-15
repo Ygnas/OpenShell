@@ -169,7 +169,9 @@ pub fn supervisor_image_should_refresh(image: &str) -> bool {
 ///
 /// The following transformations are applied in order:
 /// 1. Leading and trailing whitespace is trimmed.
-/// 2. The entire string is lowercased.
+/// 2. Only the registry/repository portion (before the first `:` or `@`) is
+///    lowercased; the tag or digest suffix is left untouched so that
+///    case-sensitive digest references (e.g. `sha256:ABCDEF…`) are preserved.
 /// 3. Consecutive forward slashes are collapsed into a single slash.
 /// 4. Any trailing slash is stripped.
 ///
@@ -182,29 +184,37 @@ pub fn supervisor_image_should_refresh(image: &str) -> bool {
 /// assert_eq!(sanitize_image_name("  ubuntu:20.04  "), "ubuntu:20.04");
 /// assert_eq!(sanitize_image_name("ghcr.io//org/image"), "ghcr.io/org/image");
 /// assert_eq!(sanitize_image_name("ghcr.io/org/image/"), "ghcr.io/org/image");
+/// assert_eq!(
+///     sanitize_image_name("ghcr.io/Org/Image@sha256:ABCDEF"),
+///     "ghcr.io/org/image@sha256:ABCDEF",
+/// );
 /// ```
 pub fn sanitize_image_name(image: &str) -> String {
-    let trimmed = image.trim().to_lowercase();
-    let collapsed = collapse_slashes(&trimmed);
-    collapsed.trim_end_matches('/').to_string()
-}
+    let trimmed = image.trim();
 
-/// Collapse consecutive forward slashes into a single slash.
-fn collapse_slashes(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    let mut prev_slash = false;
-    for ch in s.chars() {
-        if ch == '/' {
-            if !prev_slash {
-                result.push(ch);
-            }
-            prev_slash = true;
-        } else {
-            result.push(ch);
-            prev_slash = false;
-        }
-    }
-    result
+    // Split on the first `@` or `:` to isolate the registry/repository portion
+    // from the tag or digest suffix. Only the prefix is case-folded so that
+    // digest references like `sha256:ABCDEF…` are not silently corrupted.
+    let (repo_part, suffix) = if let Some(at_pos) = trimmed.find('@') {
+        (&trimmed[..at_pos], &trimmed[at_pos..])
+    } else if let Some(colon_pos) = trimmed.find(':') {
+        (&trimmed[..colon_pos], &trimmed[colon_pos..])
+    } else {
+        (trimmed, "")
+    };
+
+    let lower_repo = repo_part.to_lowercase();
+
+    // Collapse consecutive slashes in the repository portion using iterators.
+    let collapsed_repo = lower_repo
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>()
+        .join("/");
+
+    // Reassemble and strip any trailing slash that may have survived.
+    let result = format!("{}{}", collapsed_repo, suffix);
+    result.trim_end_matches('/').to_string()
 }
 
 #[cfg(test)]
@@ -222,10 +232,11 @@ mod tests {
         // Leading and trailing whitespace is trimmed.
         assert_eq!(sanitize_image_name("  ubuntu:20.04  "), "ubuntu:20.04");
 
-        // Uppercase letters are lowercased.
+        // Uppercase letters in the registry/repo portion are lowercased,
+        // but the tag suffix is preserved as-is.
         assert_eq!(
             sanitize_image_name("ghcr.io/Org/Image:Latest"),
-            "ghcr.io/org/image:latest"
+            "ghcr.io/org/image:Latest"
         );
 
         // Consecutive slashes are collapsed into a single slash.
@@ -238,6 +249,19 @@ mod tests {
         assert_eq!(
             sanitize_image_name("ghcr.io/org/image/"),
             "ghcr.io/org/image"
+        );
+
+        // Empty string returns an empty string.
+        assert_eq!(sanitize_image_name(""), "");
+
+        // Whitespace-only string returns an empty string.
+        assert_eq!(sanitize_image_name("   "), "");
+
+        // Digest reference: registry/repo portion is lowercased,
+        // digest suffix (including its case) is preserved exactly.
+        assert_eq!(
+            sanitize_image_name("ghcr.io/Org/Image@sha256:ABCDEF"),
+            "ghcr.io/org/image@sha256:ABCDEF"
         );
     }
 }
