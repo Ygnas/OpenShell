@@ -43,7 +43,10 @@ seccompiler = "0.5"
 tempfile = "3"
 
 [dev-dependencies]
+libc = "0.2"
+nix = { workspace = true }
 tempfile = "3"
+walkdir = { workspace = true }
 
 [lints]
 workspace = true
