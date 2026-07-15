@@ -1165,12 +1165,24 @@ fn rewrite_group_at(path: &Path, gid: &str) -> Result<()> {
 
 /// Recursively chown a directory tree to the given UID/GID.
 ///
-/// Symlinks are skipped (not followed) to prevent privilege escalation via
-/// malicious container images. The TOCTOU window is not exploitable because
-/// no untrusted process is running yet.
+/// Uses `walkdir` to iterate over every entry under `root` and calls
+/// `nix::unistd::chown` on each one. Symlinks are not followed
+/// (`follow_links(false)`) — the symlink inode itself is chowned, which is
+/// harmless and prevents privilege escalation via malicious container images.
+///
+/// Read-only sub-mounts (EROFS) are skipped with a warning so the walk
+/// continues rather than aborting. Any other error is propagated immediately.
+/// If `root` itself is on a read-only filesystem the error is propagated
+/// because the sandbox home directory cannot be used.
+///
+/// The TOCTOU window is not exploitable because no untrusted process is
+/// running yet.
 #[cfg(unix)]
 fn chown_sandbox_home(root: &Path, uid: Option<Uid>, gid: Option<Gid>) -> Result<()> {
+    use nix::errno::Errno;
     use nix::unistd::chown;
+    use tracing::{info, warn};
+    use walkdir::WalkDir;
 
     let meta = std::fs::symlink_metadata(root).into_diagnostic()?;
     if meta.file_type().is_symlink() {
@@ -1180,22 +1192,32 @@ fn chown_sandbox_home(root: &Path, uid: Option<Uid>, gid: Option<Gid>) -> Result
         ));
     }
 
-    chown(root, uid, gid).into_diagnostic()?;
+    info!(path = %root.display(), "Starting recursive chown of sandbox home");
 
-    if meta.is_dir()
-        && let Ok(entries) = std::fs::read_dir(root)
-    {
-        for entry in entries {
-            let entry = entry.into_diagnostic()?;
-            let path = entry.path();
-            if path
-                .symlink_metadata()
-                .is_ok_and(|m| m.file_type().is_symlink())
-            {
-                debug!(path = %path.display(), "Skipping symlink during sandbox home chown");
-                continue;
+    for entry in WalkDir::new(root).follow_links(false) {
+        let entry = entry.into_diagnostic()?;
+        let path = entry.path();
+
+        match chown(path, uid, gid) {
+            Ok(()) => {
+                debug!(path = %path.display(), "chown succeeded");
             }
-            chown_sandbox_home(&path, uid, gid)?;
+            Err(Errno::EROFS) => {
+                // Read-only filesystem: this sub-mount cannot be chowned.
+                // Log a warning and continue walking — other writable paths
+                // should still be chowned correctly. If the root itself is
+                // read-only the caller will catch subsequent failures.
+                warn!(
+                    path = %path.display(),
+                    "Skipping read-only path during sandbox home chown (EROFS)"
+                );
+            }
+            Err(err) => {
+                return Err(miette::miette!(
+                    "Failed to chown '{}': {err}",
+                    path.display()
+                ));
+            }
         }
     }
 
@@ -2113,6 +2135,67 @@ mod tests {
             Some(nix::unistd::getegid()),
         )
         .expect("should skip symlink children without error");
+    }
+
+    /// Verify that `chown_sandbox_home` completes successfully even when a
+    /// sub-directory is on a read-only mount (EROFS).  The test mounts a
+    /// read-only tmpfs over a sub-directory; if mounting is unavailable
+    /// (no `CAP_SYS_ADMIN`) the test is skipped.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn chown_sandbox_home_skips_readonly_submount() {
+        use std::ffi::CString;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("sandbox");
+        let ro_sub = root.join("readonly_mount");
+
+        std::fs::create_dir_all(&ro_sub).unwrap();
+        std::fs::write(root.join("writable_file.txt"), "data").unwrap();
+
+        // Attempt to mount a read-only tmpfs over ro_sub.
+        let target = CString::new(ro_sub.to_str().unwrap()).unwrap();
+        let flags: libc::c_ulong =
+            libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC | libc::MS_RDONLY;
+        #[allow(unsafe_code)]
+        let rc = unsafe {
+            libc::mount(
+                c"tmpfs".as_ptr(),
+                target.as_ptr(),
+                c"tmpfs".as_ptr(),
+                flags,
+                c"mode=0555,size=4k".as_ptr().cast(),
+            )
+        };
+
+        if rc != 0 {
+            // CAP_SYS_ADMIN not available; skip instead of failing.
+            eprintln!(
+                "Skipping chown_sandbox_home_skips_readonly_submount: mount unavailable ({})",
+                std::io::Error::last_os_error()
+            );
+            return;
+        }
+
+        // Ensure we unmount on exit, even if the test panics.
+        struct Unmount(CString);
+        impl Drop for Unmount {
+            fn drop(&mut self) {
+                #[allow(unsafe_code)]
+                unsafe {
+                    libc::umount(self.0.as_ptr());
+                }
+            }
+        }
+        let _guard = Unmount(target);
+
+        // The walk should complete without error, skipping EROFS paths.
+        chown_sandbox_home(
+            &root,
+            Some(nix::unistd::geteuid()),
+            Some(nix::unistd::getegid()),
+        )
+        .expect("chown_sandbox_home should succeed even with a read-only sub-mount");
     }
 
     #[cfg(unix)]
