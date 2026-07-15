@@ -170,27 +170,39 @@ pub fn supervisor_image_should_refresh(image: &str) -> bool {
 /// The following transformations are applied in order:
 /// 1. Leading and trailing ASCII whitespace is trimmed.
 /// 2. The entire string is lowercased.
-/// 3. Consecutive forward-slashes are collapsed into a single slash.
+/// 3. Consecutive forward-slashes are collapsed into a single slash,
+///    **except** when the preceding character is `:` (preserving `://` in
+///    scheme prefixes such as `docker://` or `oci://`).
 /// 4. Any trailing slash is removed.
+///
+/// Returns `None` when the input is empty or contains only whitespace, so
+/// callers receive a clear signal rather than an empty string that would
+/// cause a confusing downstream error.
 ///
 /// # Examples
 /// ```
 /// use openshell_core::driver_utils::sanitize_image_name;
 ///
-/// assert_eq!(sanitize_image_name("Ubuntu:22.04"), "ubuntu:22.04");
-/// assert_eq!(sanitize_image_name("  ghcr.io/org/image:tag  "), "ghcr.io/org/image:tag");
-/// assert_eq!(sanitize_image_name("ghcr.io//org//image"), "ghcr.io/org/image");
-/// assert_eq!(sanitize_image_name("ghcr.io/org/image/"), "ghcr.io/org/image");
+/// assert_eq!(sanitize_image_name("Ubuntu:22.04"), Some("ubuntu:22.04".to_string()));
+/// assert_eq!(sanitize_image_name("  ghcr.io/org/image:tag  "), Some("ghcr.io/org/image:tag".to_string()));
+/// assert_eq!(sanitize_image_name("ghcr.io//org//image"), Some("ghcr.io/org/image".to_string()));
+/// assert_eq!(sanitize_image_name("ghcr.io/org/image/"), Some("ghcr.io/org/image".to_string()));
+/// assert_eq!(sanitize_image_name("docker://registry.example.com/org/image:tag"), Some("docker://registry.example.com/org/image:tag".to_string()));
+/// assert_eq!(sanitize_image_name("   "), None);
+/// assert_eq!(sanitize_image_name(""), None);
 /// ```
-pub fn sanitize_image_name(image: &str) -> String {
+pub fn sanitize_image_name(image: &str) -> Option<String> {
     let trimmed = image.trim().to_lowercase();
-    // Collapse consecutive slashes.
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Collapse consecutive slashes, but preserve `://` scheme separators.
     let collapsed = {
         let mut result = String::with_capacity(trimmed.len());
         let mut last_slash = false;
         for ch in trimmed.chars() {
             if ch == '/' {
-                if !last_slash {
+                if !last_slash || result.ends_with(':') {
                     result.push(ch);
                 }
                 last_slash = true;
@@ -202,7 +214,7 @@ pub fn sanitize_image_name(image: &str) -> String {
         result
     };
     // Strip trailing slash.
-    collapsed.trim_end_matches('/').to_string()
+    Some(collapsed.trim_end_matches('/').to_string())
 }
 
 #[cfg(test)]
@@ -214,31 +226,47 @@ mod tests {
         // Normal image name passes through unchanged.
         assert_eq!(
             sanitize_image_name("ghcr.io/org/image:1.0"),
-            "ghcr.io/org/image:1.0"
+            Some("ghcr.io/org/image:1.0".to_string())
         );
 
         // Leading and trailing whitespace is trimmed.
         assert_eq!(
             sanitize_image_name("  ubuntu:22.04  "),
-            "ubuntu:22.04"
+            Some("ubuntu:22.04".to_string())
         );
 
         // Uppercase letters are lowercased.
         assert_eq!(
             sanitize_image_name("Ubuntu:22.04"),
-            "ubuntu:22.04"
+            Some("ubuntu:22.04".to_string())
         );
 
         // Consecutive slashes are collapsed to a single slash.
         assert_eq!(
             sanitize_image_name("ghcr.io//org//image:tag"),
-            "ghcr.io/org/image:tag"
+            Some("ghcr.io/org/image:tag".to_string())
         );
 
         // Trailing slash is stripped.
         assert_eq!(
             sanitize_image_name("ghcr.io/org/image/"),
-            "ghcr.io/org/image"
+            Some("ghcr.io/org/image".to_string())
         );
+
+        // Scheme-prefixed references: `://` must not be collapsed.
+        assert_eq!(
+            sanitize_image_name("docker://registry.example.com/org/image:tag"),
+            Some("docker://registry.example.com/org/image:tag".to_string())
+        );
+        assert_eq!(
+            sanitize_image_name("oci://registry.example.com/org/image:latest"),
+            Some("oci://registry.example.com/org/image:latest".to_string())
+        );
+
+        // Whitespace-only input returns None.
+        assert_eq!(sanitize_image_name("   "), None);
+
+        // Empty input returns None.
+        assert_eq!(sanitize_image_name(""), None);
     }
 }
