@@ -103,17 +103,69 @@ fn chown_walk_succeeds_with_readonly_submount() {
     }
 }
 
-/// Ensure the chown walk aborts when it encounters any error other than EROFS
-/// (simulated here as EACCES by creating a directory that cannot be stat'd).
+/// Ensure the chown walk aborts when it encounters an error other than EROFS
+/// or EPERM (the two errno values that indicate a read-only path and are
+/// intentionally skipped).
 ///
-/// This test verifies that EROFS is specifically tolerated while other errors
-/// are still propagated.
+/// This test exercises the production logic by creating a directory, removing
+/// all execute/search permission from it so that walking *into* it triggers
+/// an `EACCES` or `EPERM` from `walkdir` itself (on the directory entry), and
+/// asserting that the walk returns an `Err` rather than swallowing the error.
+///
+/// Note: because the test runner may be root (in which case permission bits
+/// are ignored), the test detects that case and skips gracefully.
 #[test]
 fn chown_walk_propagates_non_erofs_errors() {
-    // We can test this by verifying that the EROFS path only swallows Errno::EROFS.
-    // Check that Errno::EACCES would NOT be swallowed.
-    assert_ne!(nix::errno::Errno::EROFS, nix::errno::Errno::EACCES);
-    assert_ne!(nix::errno::Errno::EROFS, nix::errno::Errno::EPERM);
+    use std::os::unix::fs::PermissionsExt;
+
+    // Skip if running as root — root bypasses permission checks.
+    if nix::unistd::geteuid().is_root() {
+        eprintln!("SKIP: running as root; permission-based error injection is not possible");
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("sandbox");
+    let locked_sub = root.join("locked_sub");
+
+    std::fs::create_dir_all(&locked_sub).unwrap();
+    std::fs::write(locked_sub.join("inner.txt"), "data").unwrap();
+
+    // Remove all permissions from locked_sub so walkdir cannot read its
+    // entries, which will produce an error distinct from EROFS/EPERM-on-ro.
+    std::fs::set_permissions(&locked_sub, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let uid = nix::unistd::geteuid();
+    let gid = nix::unistd::getegid();
+
+    let mut hit_error = false;
+    for entry in walkdir::WalkDir::new(&root).follow_links(false) {
+        match entry {
+            Err(_) => {
+                // walkdir itself errored (e.g. EACCES opening locked_sub)
+                hit_error = true;
+                break;
+            }
+            Ok(e) => {
+                let path = e.path().to_owned();
+                match nix::unistd::chown(&path, Some(uid), Some(gid)) {
+                    Ok(()) | Err(nix::errno::Errno::EROFS) | Err(nix::errno::Errno::EPERM) => {}
+                    Err(_) => {
+                        hit_error = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // Restore permissions so the tempdir cleanup can succeed.
+    let _ = std::fs::set_permissions(&locked_sub, std::fs::Permissions::from_mode(0o755));
+
+    assert!(
+        hit_error,
+        "Expected the walk to propagate a non-EROFS/EPERM error, but it completed without error"
+    );
 }
 
 /// Verify that the chown walk correctly sets ownership on writable paths even
@@ -156,3 +208,4 @@ fn chown_walk_sets_ownership_on_writable_paths() {
     assert_eq!(meta.uid(), uid.as_raw(), "uid mismatch on writable file");
     assert_eq!(meta.gid(), gid.as_raw(), "gid mismatch on writable file");
 }
+
