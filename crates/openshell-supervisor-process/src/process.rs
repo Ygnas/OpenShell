@@ -6,6 +6,8 @@
 use crate::child_env;
 #[cfg(target_os = "linux")]
 use crate::managed_children;
+#[cfg(unix)]
+use crate::mount::get_readonly_mount_points;
 #[cfg(target_os = "linux")]
 use crate::netns::NetworkNamespace;
 use crate::sandbox;
@@ -1163,13 +1165,24 @@ fn rewrite_group_at(path: &Path, gid: &str) -> Result<()> {
     Ok(())
 }
 
-/// Recursively chown a directory tree to the given UID/GID.
+/// Recursively chown a directory tree to the given UID/GID, skipping any
+/// sub-directory that is a known read-only mount point.
 ///
 /// Symlinks are skipped (not followed) to prevent privilege escalation via
 /// malicious container images. The TOCTOU window is not exploitable because
 /// no untrusted process is running yet.
+///
+/// If `chown` returns `EROFS` for a path that was not pre-filtered (e.g. a
+/// file inside a read-only bind-mount discovered after the walk starts), a
+/// warning is logged and traversal continues rather than aborting. All other
+/// errors are propagated.
 #[cfg(unix)]
-fn chown_sandbox_home(root: &Path, uid: Option<Uid>, gid: Option<Gid>) -> Result<()> {
+fn chown_sandbox_home(
+    root: &Path,
+    uid: Option<Uid>,
+    gid: Option<Gid>,
+    ro_mounts: &std::collections::HashSet<std::path::PathBuf>,
+) -> Result<()> {
     use nix::unistd::chown;
 
     let meta = std::fs::symlink_metadata(root).into_diagnostic()?;
@@ -1180,7 +1193,27 @@ fn chown_sandbox_home(root: &Path, uid: Option<Uid>, gid: Option<Gid>) -> Result
         ));
     }
 
-    chown(root, uid, gid).into_diagnostic()?;
+    // Skip the entire subtree when this path is a read-only mount point.
+    if ro_mounts.contains(root) {
+        info!(
+            path = %root.display(),
+            "Skipping read-only mount during sandbox home chown"
+        );
+        return Ok(());
+    }
+
+    match chown(root, uid, gid) {
+        Ok(()) => {}
+        Err(err) if err == nix::errno::Errno::EROFS => {
+            tracing::warn!(
+                path = %root.display(),
+                error = %err,
+                "chown skipped read-only path (EROFS)"
+            );
+            return Ok(());
+        }
+        Err(err) => return Err(miette::miette!("chown '{}': {err}", root.display())),
+    }
 
     if meta.is_dir()
         && let Ok(entries) = std::fs::read_dir(root)
@@ -1195,7 +1228,7 @@ fn chown_sandbox_home(root: &Path, uid: Option<Uid>, gid: Option<Gid>) -> Result
                 debug!(path = %path.display(), "Skipping symlink during sandbox home chown");
                 continue;
             }
-            chown_sandbox_home(&path, uid, gid)?;
+            chown_sandbox_home(&path, uid, gid, ro_mounts)?;
         }
     }
 
@@ -1264,12 +1297,16 @@ pub fn prepare_filesystem(policy: &SandboxPolicy) -> Result<()> {
     // /sandbox home directory may already exist with image-default ownership
     // (e.g. UID 1000) that differs from the driver-assigned identity.
     // Recursively chown /sandbox so the sandbox process can use its home
-    // directory.
+    // directory, but skip any sub-directory that is a read-only mount point
+    // (e.g. a Kubernetes readOnly volume) to avoid EROFS failures.
     if std::env::var(openshell_core::sandbox_env::SANDBOX_UID).is_ok() {
         let sandbox_home = Path::new("/sandbox");
         if sandbox_home.exists() {
+            // Build the read-only mount set once; fall back to an empty set
+            // if /proc/self/mountinfo is unavailable (non-Linux environments).
+            let ro_mounts = get_readonly_mount_points().unwrap_or_default();
             info!(?uid, ?gid, "Chowning /sandbox for driver-injected UID/GID");
-            chown_sandbox_home(sandbox_home, uid, gid)?;
+            chown_sandbox_home(sandbox_home, uid, gid, &ro_mounts)?;
         }
     }
 
@@ -2048,7 +2085,8 @@ mod tests {
         let expected_uid = nix::unistd::geteuid();
         let expected_gid = nix::unistd::getegid();
 
-        chown_sandbox_home(&root, Some(expected_uid), Some(expected_gid)).unwrap();
+        let ro_mounts = std::collections::HashSet::new();
+        chown_sandbox_home(&root, Some(expected_uid), Some(expected_gid), &ro_mounts).unwrap();
 
         for path in &[
             root.clone(),
@@ -2083,15 +2121,59 @@ mod tests {
         std::fs::create_dir(&target).unwrap();
         symlink(&target, &link).unwrap();
 
+        let ro_mounts = std::collections::HashSet::new();
         let err = chown_sandbox_home(
             &link,
             Some(nix::unistd::geteuid()),
             Some(nix::unistd::getegid()),
+            &ro_mounts,
         )
         .unwrap_err();
         assert!(
             err.to_string().contains("symlink"),
             "expected symlink rejection: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn chown_sandbox_home_skips_readonly_mount_subtree() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("sandbox");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("rw_file.txt"), "hello").unwrap();
+
+        // Simulate a read-only sub-mount directory.
+        let ro_sub = root.join("ro_volume");
+        std::fs::create_dir(&ro_sub).unwrap();
+        std::fs::write(ro_sub.join("secret.txt"), "secret").unwrap();
+
+        let uid = nix::unistd::geteuid();
+        let gid = nix::unistd::getegid();
+
+        // Mark the sub-directory as a read-only mount point.
+        let mut ro_mounts = std::collections::HashSet::new();
+        ro_mounts.insert(ro_sub.clone());
+
+        // Record ownership of the "secret" file before the chown walk.
+        let before = std::fs::metadata(ro_sub.join("secret.txt")).unwrap();
+
+        chown_sandbox_home(&root, Some(uid), Some(gid), &ro_mounts)
+            .expect("chown should succeed, skipping the ro sub-mount");
+
+        // The file inside the read-only mount must NOT have been re-owned.
+        let after = std::fs::metadata(ro_sub.join("secret.txt")).unwrap();
+        assert_eq!(
+            after.uid(),
+            before.uid(),
+            "uid of file inside ro mount must not change"
+        );
+        assert_eq!(
+            after.gid(),
+            before.gid(),
+            "gid of file inside ro mount must not change"
         );
     }
 
@@ -2107,10 +2189,12 @@ mod tests {
         std::fs::write(&target, "secret").unwrap();
         symlink(&target, root.join("link")).unwrap();
 
+        let ro_mounts = std::collections::HashSet::new();
         chown_sandbox_home(
             &root,
             Some(nix::unistd::geteuid()),
             Some(nix::unistd::getegid()),
+            &ro_mounts,
         )
         .expect("should skip symlink children without error");
     }
@@ -2393,3 +2477,4 @@ mod tests {
         );
     }
 }
+
