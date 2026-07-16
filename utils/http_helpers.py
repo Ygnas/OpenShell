@@ -16,8 +16,17 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+
+def _compute_backoff(attempt: int, base_delay: float) -> float:
+    """Return exponential backoff delay with uniform jitter.
+
+    Formula: ``base_delay * 2^attempt + random(0, 1)``
+    """
+    return base_delay * (2 ** attempt) + random.random()  # noqa: S311
+
+
 # HTTP status codes that are considered retryable
-_RETRYABLE_STATUS_CODES = frozenset({429, 500, 501, 502, 503, 504, 505, 506, 507, 508, 509, 510, 511})
+_RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504, 505, 506, 507, 508, 509, 510, 511})
 
 
 def retry_with_backoff(
@@ -54,13 +63,10 @@ def retry_with_backoff(
         >>> import httpx
         >>> response = retry_with_backoff(lambda: httpx.get("https://example.com"))
     """
-    last_exception: BaseException | None = None
-
     for attempt in range(max_retries + 1):
         try:
             response = func()
         except Exception as exc:
-            last_exception = exc
             if attempt == max_retries:
                 logger.error(
                     "All %d retry attempt(s) exhausted. Raising last exception.",
@@ -68,7 +74,7 @@ def retry_with_backoff(
                 )
                 raise
 
-            wait_time = base_delay * (2 ** attempt) + random.random()  # noqa: S311
+            wait_time = _compute_backoff(attempt, base_delay)
             logger.warning(
                 "Attempt %d/%d failed with exception %r. Retrying in %.2fs.",
                 attempt + 1,
@@ -95,7 +101,7 @@ def retry_with_backoff(
                 f"(last status code: {response.status_code})"
             )
 
-        wait_time = base_delay * (2 ** attempt) + random.random()  # noqa: S311
+        wait_time = _compute_backoff(attempt, base_delay)
         logger.warning(
             "Attempt %d/%d received status %d. Retrying in %.2fs.",
             attempt + 1,
