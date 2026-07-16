@@ -26,7 +26,7 @@ use std::process::Stdio;
 #[cfg(target_os = "linux")]
 use std::sync::OnceLock;
 use tokio::process::{Child, Command};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Process/filesystem enforcement performed by the process supervisor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1163,29 +1163,21 @@ fn rewrite_group_at(path: &Path, gid: &str) -> Result<()> {
     Ok(())
 }
 
-/// Checks whether `path` resides on a read-only mount point.
+/// Parses `/proc/self/mountinfo` once and returns the set of mount points that
+/// are mounted read-only.
 ///
-/// Parses `/proc/self/mountinfo` to find the longest matching mount point for
-/// the canonical form of `path`, then checks whether that mount's options
-/// include the `ro` flag. Returns `Ok(false)` if no mount point entry is
-/// found, so the caller can proceed normally.
+/// mountinfo format (per `man 5 proc`):
+///   `<mount_id> <parent_id> <major:minor> <root> <mount_point> <mount_options> ...`
 ///
-/// This function is called only during sandbox startup (before any untrusted
-/// process is running), so the per-call cost of opening `/proc/self/mountinfo`
-/// is not a concern. Caching can be added later if profiling shows a
-/// bottleneck.
+/// The `ro` flag in `<mount_options>` indicates a read-only mount.
 #[cfg(unix)]
-fn is_readonly_mount(path: &Path) -> std::io::Result<bool> {
+fn parse_readonly_mounts() -> std::io::Result<std::collections::HashSet<PathBuf>> {
     use std::io::BufRead;
 
-    let canonical = path.canonicalize()?;
     let file = std::fs::File::open("/proc/self/mountinfo")?;
     let reader = std::io::BufReader::new(file);
 
-    // Find the longest matching mount point.
-    // mountinfo format:
-    //   <mount_id> <parent_id> <major:minor> <root> <mount_point> <mount_options> ...
-    let mut best_match: Option<(std::path::PathBuf, String)> = None;
+    let mut readonly_mounts = std::collections::HashSet::new();
     for line in reader.lines() {
         let line = line?;
         let mut parts = line.split_whitespace();
@@ -1196,22 +1188,31 @@ fn is_readonly_mount(path: &Path) -> std::io::Result<bool> {
         let mount_point = parts.next().unwrap_or("");
         let options = parts.next().unwrap_or("");
 
-        let mp = std::path::Path::new(mount_point);
-        if canonical.starts_with(mp) {
-            let is_longer = best_match
-                .as_ref()
-                .map_or(true, |(prev, _)| mp.as_os_str().len() > prev.as_os_str().len());
-            if is_longer {
-                best_match = Some((mp.to_path_buf(), options.to_string()));
-            }
+        if options.split(',').any(|o| o == "ro") {
+            readonly_mounts.insert(PathBuf::from(mount_point));
         }
     }
 
-    if let Some((_mp, opts)) = best_match {
-        Ok(opts.split(',').any(|o| o == "ro"))
-    } else {
-        Ok(false)
-    }
+    Ok(readonly_mounts)
+}
+
+/// Checks whether `path` resides on a read-only mount point.
+///
+/// Uses a pre-parsed set of read-only mount points (from [`parse_readonly_mounts`])
+/// and performs longest-prefix matching so nested mounts are correctly detected.
+/// Returns `false` if no mount point entry is found, so the caller can proceed
+/// normally.
+#[cfg(unix)]
+fn is_readonly_mount(
+    canonical: &Path,
+    readonly_mounts: &std::collections::HashSet<PathBuf>,
+) -> bool {
+    // Find the longest matching mount point prefix.
+    readonly_mounts
+        .iter()
+        .filter(|mp| canonical.starts_with(mp.as_path()))
+        .max_by_key(|mp| mp.as_os_str().len())
+        .is_some()
 }
 
 /// Recursively chown a directory tree to the given UID/GID.
@@ -1228,8 +1229,17 @@ fn is_readonly_mount(path: &Path) -> std::io::Result<bool> {
 ///
 /// This prevents `CrashLoopBackOff` when Kubernetes injects `readOnly: true`
 /// volumes under `/sandbox` and the supervisor performs a recursive `chown`.
+///
+/// `readonly_mounts` is the pre-parsed set of read-only mount points returned
+/// by [`parse_readonly_mounts`]; it is parsed once by the caller and threaded
+/// through the recursion to avoid repeated `/proc/self/mountinfo` reads.
 #[cfg(unix)]
-fn chown_sandbox_home(root: &Path, uid: Option<Uid>, gid: Option<Gid>) -> Result<()> {
+fn chown_sandbox_home(
+    root: &Path,
+    uid: Option<Uid>,
+    gid: Option<Gid>,
+    readonly_mounts: &std::collections::HashSet<PathBuf>,
+) -> Result<()> {
     use nix::errno::Errno;
     use nix::unistd::chown;
 
@@ -1258,18 +1268,21 @@ fn chown_sandbox_home(root: &Path, uid: Option<Uid>, gid: Option<Gid>) -> Result
                 continue;
             }
 
+            // Resolve once to avoid a double `stat` syscall below.
+            let is_dir = path.is_dir();
+
             // Skip entire subtrees that are read-only mount points to avoid
             // EROFS errors that would abort supervisor startup.
-            if path.is_dir() && is_readonly_mount(&path).unwrap_or(false) {
-                debug!(
-                    path = %path.display(),
-                    "Skipping read-only mount subtree during sandbox home chown"
-                );
-                continue;
-            }
-
-            if path.is_dir() {
-                chown_sandbox_home(&path, uid, gid)?;
+            if is_dir {
+                let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+                if is_readonly_mount(&canonical, readonly_mounts) {
+                    debug!(
+                        path = %path.display(),
+                        "Skipping read-only mount subtree during sandbox home chown"
+                    );
+                    continue;
+                }
+                chown_sandbox_home(&path, uid, gid, readonly_mounts)?;
             } else {
                 // For files, ignore EROFS (read-only filesystem); propagate
                 // all other errors. A file inside a read-only mount may not
@@ -1364,7 +1377,20 @@ pub fn prepare_filesystem(policy: &SandboxPolicy) -> Result<()> {
         let sandbox_home = Path::new("/sandbox");
         if sandbox_home.exists() {
             info!(?uid, ?gid, "Chowning /sandbox for driver-injected UID/GID");
-            chown_sandbox_home(sandbox_home, uid, gid)?;
+            // Parse /proc/self/mountinfo once here and thread it through the
+            // recursion (fixes O(D×M) repeated file reads — Issue 1).
+            // If parsing fails (e.g. /proc is not mounted), log a warning and
+            // fall back to an empty set so EROFS handling still protects us
+            // (fixes silent error swallowing — Issue 2).
+            let readonly_mounts = parse_readonly_mounts().unwrap_or_else(|e| {
+                warn!(
+                    error = %e,
+                    "Failed to parse /proc/self/mountinfo; read-only mount detection \
+                     disabled — EROFS errors will still be tolerated on individual files"
+                );
+                std::collections::HashSet::new()
+            });
+            chown_sandbox_home(sandbox_home, uid, gid, &readonly_mounts)?;
         }
     }
 
@@ -2143,7 +2169,7 @@ mod tests {
         let expected_uid = nix::unistd::geteuid();
         let expected_gid = nix::unistd::getegid();
 
-        chown_sandbox_home(&root, Some(expected_uid), Some(expected_gid)).unwrap();
+        chown_sandbox_home(&root, Some(expected_uid), Some(expected_gid), &std::collections::HashSet::new()).unwrap();
 
         for path in &[
             root.clone(),
@@ -2182,6 +2208,7 @@ mod tests {
             &link,
             Some(nix::unistd::geteuid()),
             Some(nix::unistd::getegid()),
+            &std::collections::HashSet::new(),
         )
         .unwrap_err();
         assert!(
@@ -2206,6 +2233,7 @@ mod tests {
             &root,
             Some(nix::unistd::geteuid()),
             Some(nix::unistd::getegid()),
+            &std::collections::HashSet::new(),
         )
         .expect("should skip symlink children without error");
     }
