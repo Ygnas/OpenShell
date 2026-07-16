@@ -1163,13 +1163,74 @@ fn rewrite_group_at(path: &Path, gid: &str) -> Result<()> {
     Ok(())
 }
 
+/// Checks whether `path` resides on a read-only mount point.
+///
+/// Parses `/proc/self/mountinfo` to find the longest matching mount point for
+/// the canonical form of `path`, then checks whether that mount's options
+/// include the `ro` flag. Returns `Ok(false)` if no mount point entry is
+/// found, so the caller can proceed normally.
+///
+/// This function is called only during sandbox startup (before any untrusted
+/// process is running), so the per-call cost of opening `/proc/self/mountinfo`
+/// is not a concern. Caching can be added later if profiling shows a
+/// bottleneck.
+#[cfg(unix)]
+fn is_readonly_mount(path: &Path) -> std::io::Result<bool> {
+    use std::io::BufRead;
+
+    let canonical = path.canonicalize()?;
+    let file = std::fs::File::open("/proc/self/mountinfo")?;
+    let reader = std::io::BufReader::new(file);
+
+    // Find the longest matching mount point.
+    // mountinfo format:
+    //   <mount_id> <parent_id> <major:minor> <root> <mount_point> <mount_options> ...
+    let mut best_match: Option<(std::path::PathBuf, String)> = None;
+    for line in reader.lines() {
+        let line = line?;
+        let mut parts = line.split_whitespace();
+        let _mount_id = parts.next();
+        let _parent_id = parts.next();
+        let _major_minor = parts.next();
+        let _root = parts.next();
+        let mount_point = parts.next().unwrap_or("");
+        let options = parts.next().unwrap_or("");
+
+        let mp = std::path::Path::new(mount_point);
+        if canonical.starts_with(mp) {
+            let is_longer = best_match
+                .as_ref()
+                .map_or(true, |(prev, _)| mp.as_os_str().len() > prev.as_os_str().len());
+            if is_longer {
+                best_match = Some((mp.to_path_buf(), options.to_string()));
+            }
+        }
+    }
+
+    if let Some((_mp, opts)) = best_match {
+        Ok(opts.split(',').any(|o| o == "ro"))
+    } else {
+        Ok(false)
+    }
+}
+
 /// Recursively chown a directory tree to the given UID/GID.
 ///
 /// Symlinks are skipped (not followed) to prevent privilege escalation via
 /// malicious container images. The TOCTOU window is not exploitable because
 /// no untrusted process is running yet.
+///
+/// Read-only sub-mounts under the tree are handled gracefully:
+/// - If a directory entry is itself a read-only mount point, the entire
+///   subtree rooted there is skipped with a debug log.
+/// - If a `chown` call fails with `EROFS` (read-only filesystem), the error
+///   is treated as non-fatal and the walk continues; any other error aborts.
+///
+/// This prevents `CrashLoopBackOff` when Kubernetes injects `readOnly: true`
+/// volumes under `/sandbox` and the supervisor performs a recursive `chown`.
 #[cfg(unix)]
 fn chown_sandbox_home(root: &Path, uid: Option<Uid>, gid: Option<Gid>) -> Result<()> {
+    use nix::errno::Errno;
     use nix::unistd::chown;
 
     let meta = std::fs::symlink_metadata(root).into_diagnostic()?;
@@ -1188,6 +1249,7 @@ fn chown_sandbox_home(root: &Path, uid: Option<Uid>, gid: Option<Gid>) -> Result
         for entry in entries {
             let entry = entry.into_diagnostic()?;
             let path = entry.path();
+
             if path
                 .symlink_metadata()
                 .is_ok_and(|m| m.file_type().is_symlink())
@@ -1195,7 +1257,40 @@ fn chown_sandbox_home(root: &Path, uid: Option<Uid>, gid: Option<Gid>) -> Result
                 debug!(path = %path.display(), "Skipping symlink during sandbox home chown");
                 continue;
             }
-            chown_sandbox_home(&path, uid, gid)?;
+
+            // Skip entire subtrees that are read-only mount points to avoid
+            // EROFS errors that would abort supervisor startup.
+            if path.is_dir() && is_readonly_mount(&path).unwrap_or(false) {
+                debug!(
+                    path = %path.display(),
+                    "Skipping read-only mount subtree during sandbox home chown"
+                );
+                continue;
+            }
+
+            if path.is_dir() {
+                chown_sandbox_home(&path, uid, gid)?;
+            } else {
+                // For files, ignore EROFS (read-only filesystem); propagate
+                // all other errors. A file inside a read-only mount may not
+                // be detected by is_readonly_mount if the mount point is an
+                // ancestor directory that was already recursed into.
+                match chown(&path, uid, gid) {
+                    Ok(()) => {}
+                    Err(e) if e == Errno::EROFS => {
+                        debug!(
+                            path = %path.display(),
+                            "Ignoring EROFS during sandbox home chown (read-only filesystem)"
+                        );
+                    }
+                    Err(e) => {
+                        return Err(miette::miette!(
+                            "chown failed for '{}': {e}",
+                            path.display()
+                        ));
+                    }
+                }
+            }
         }
     }
 
