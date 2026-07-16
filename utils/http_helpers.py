@@ -9,7 +9,6 @@ import logging
 import random
 import time
 from collections.abc import Callable
-from typing import Any
 
 import httpx
 
@@ -42,10 +41,12 @@ def retry_with_backoff(
         The :class:`httpx.Response` returned by *func* on success.
 
     Raises:
-        Exception: Re-raises the last exception raised by *func* after all
-            retry attempts have been exhausted.
+        httpx.HTTPStatusError: Re-raises when all retries are exhausted and
+            the last failure was a retryable HTTP status code.
+        httpx.TransportError: Re-raises when all retries are exhausted and
+            the last failure was a transport-level error.
     """
-    last_exception: Exception | None = None
+    last_exception: httpx.HTTPStatusError | httpx.TransportError | None = None
 
     for attempt in range(max_retries + 1):
         try:
@@ -53,21 +54,17 @@ def retry_with_backoff(
             if response.status_code not in _RETRYABLE_STATUS_CODES:
                 return response
 
-            exc = httpx.HTTPStatusError(
+            last_exception = httpx.HTTPStatusError(
                 f"HTTP {response.status_code}",
                 request=response.request,
                 response=response,
             )
 
-            if attempt == max_retries:
-                raise exc
-
+        except (httpx.HTTPStatusError, httpx.TransportError) as exc:
             last_exception = exc
 
-        except Exception as exc:  # noqa: BLE001
-            if attempt == max_retries:
-                raise
-            last_exception = exc
+        if attempt == max_retries:
+            break
 
         wait = base_delay * (2**attempt) + random.random()  # noqa: S311
         logger.warning(
@@ -79,5 +76,4 @@ def retry_with_backoff(
         )
         time.sleep(wait)
 
-    # Unreachable, but satisfies type checkers.
-    raise RuntimeError("retry_with_backoff: exhausted retries without raising")
+    raise last_exception  # type: ignore[misc]
