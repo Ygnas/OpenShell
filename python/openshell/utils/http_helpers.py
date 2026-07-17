@@ -45,7 +45,7 @@ def retry_with_backoff(
             times.  Defaults to ``3``.
         base_delay: Base delay in seconds used to compute the exponential
             back-off interval.  The wait time for attempt *n* (0-indexed) is
-            ``base_delay * 2**n + random(0, 1)``.  Defaults to ``1.0``.
+            ``base_delay * (2**n + random(0, 1))``.  Defaults to ``1.0``.
 
     Returns:
         The :class:`httpx.Response` returned by *func* on a successful
@@ -69,8 +69,8 @@ def retry_with_backoff(
     for attempt in range(max_retries + 1):
         try:
             response = func()
-        except Exception as exc:  # noqa: BLE001
-            raise exc from None
+        except Exception:  # noqa: BLE001
+            raise
 
         if response.status_code not in _RETRYABLE_STATUS_CODES:
             return response
@@ -81,7 +81,7 @@ def retry_with_backoff(
         )
 
         if attempt < max_retries:
-            wait = base_delay * (2**attempt) + random.random()  # noqa: S311
+            wait = base_delay * (2**attempt + random.random())  # noqa: S311
             logger.warning(
                 "Retrying after HTTP %s (attempt %d/%d, waiting %.2fs)",
                 response.status_code,
