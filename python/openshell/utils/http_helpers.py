@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 # HTTP status codes that warrant a retry
 _RETRYABLE_STATUS_CODES: frozenset[int] = frozenset(
-    {429, 500, 501, 502, 503, 504, 505, 506, 507, 508, 509, 510, 511}
+    {429, 500, 502, 503, 504, 505, 506, 507, 508, 509, 510, 511}
 )
 
 
@@ -51,6 +51,9 @@ def retry_with_backoff(
             retryable HTTP status code rather than raising, the response
             is returned as-is so the caller can inspect it.
     """
+    if max_retries < 0:
+        raise ValueError("max_retries must be >= 0")
+
     last_exception: Exception | None = None
 
     for attempt in range(max_retries + 1):
