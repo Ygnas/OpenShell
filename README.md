@@ -4,13 +4,14 @@
 [![PyPI](https://img.shields.io/badge/PyPI-openshell-orange?logo=pypi)](https://pypi.org/project/openshell/)
 [![Security Policy](https://img.shields.io/badge/Security-Report%20a%20Vulnerability-red)](SECURITY.md)
 [![Documentation](https://img.shields.io/badge/docs-latest-brightgreen)](https://docs.nvidia.com/openshell/latest/index.html)
-[![Project Status](https://img.shields.io/badge/status-alpha-orange)](https://docs.nvidia.com/openshell/latest/about/release-notes.html)
+[![Project Status](https://img.shields.io/badge/status-beta-orange)](https://docs.nvidia.com/openshell/latest/about/release-notes.html)
 
 OpenShell is the safe, private runtime for autonomous AI agents. It provides sandboxed execution environments that protect your data, credentials, and infrastructure — governed by declarative YAML policies that prevent unauthorized file access, data exfiltration, and uncontrolled network activity.
 
 OpenShell is built agent-first. The project ships with agent skills for everything from gateway troubleshooting to policy generation, and we expect contributors to use them.
 
-> **Alpha software — single-player mode.** OpenShell is proof-of-life: one developer, one environment, one gateway. We are building toward multi-tenant enterprise deployments, but the starting point is getting your own environment up and running. Expect rough edges. Bring your agent.
+> **Beta software — single-player mode and multiplayer support.**
+> OpenShell now offers a richer experience with new features and improved stability. We are building toward multi-tenant enterprise deployments, but the starting point is getting your own environment up and running. Bring your agent.
 
 ## Quickstart
 
