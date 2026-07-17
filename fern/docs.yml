@@ -13,7 +13,7 @@ title: NVIDIA OpenShell
 global-theme: nvidia
 
 announcement:
-  message: "🔔 NVIDIA OpenShell is <strong>alpha software</strong>. APIs and behavior may change without notice. Do not use in production."
+  message: "🔔 NVIDIA OpenShell is <strong>beta software</strong>. APIs and behavior may change without notice. Use in production at your own risk."
 
 footer: ./components/CustomFooter.tsx
 
