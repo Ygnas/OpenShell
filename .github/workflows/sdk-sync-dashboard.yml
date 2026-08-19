@@ -24,12 +24,7 @@ concurrency:
 jobs:
   sdk_sync_check:
     name: Sync Check
-    runs-on: linux-amd64-cpu8
-    container:
-      image: ghcr.io/nvidia/openshell/ci:latest
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
+    runs-on: ubuntu-latest
     outputs:
       go_drift_report: ${{ steps.go_drift.outputs.report }}
       go_has_drift: ${{ steps.go_drift.outputs.has_drift }}
