@@ -37,6 +37,11 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - name: Install mise
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://mise.run | MISE_VERSION=v2026.4.25 sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
       - name: Install tools
         run: mise install --locked
 
@@ -112,6 +117,11 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - name: Install mise
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://mise.run | MISE_VERSION=v2026.4.25 sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
       - name: Install tools
         run: mise install --locked
 
@@ -173,6 +183,12 @@ jobs:
 
       - if: matrix.sdk.has_drift == 'true' && matrix.sdk.build_failed == 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install mise
+        if: matrix.sdk.has_drift == 'true' && matrix.sdk.build_failed == 'true'
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://mise.run | MISE_VERSION=v2026.4.25 sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Install tools
         if: matrix.sdk.has_drift == 'true' && matrix.sdk.build_failed == 'true'
