@@ -178,3 +178,79 @@ fi
 echo "Proto check passed: generated files are up to date."
 """
 hide = true
+
+["go:proto:drift"]
+description = "Check Go SDK proto drift and output a JSON report"
+dir = "sdk/go"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+
+SDK_ROOT=$(pwd -P)
+REPO_ROOT=$(cd ../.. && pwd -P)
+
+for tool in buf protoc-gen-go protoc-gen-go-grpc jq; do
+  if ! command -v "$tool" &>/dev/null; then
+    echo '{"sdk":"go","synced":false,"error":"'"$tool"' not found"}' >&2
+    exit 1
+  fi
+done
+
+WORK_DIR=$(mktemp -d)
+trap 'rm -rf "$WORK_DIR"' EXIT
+
+CHECK_TEMPLATE=$(sed 's|out: sdk/go|out: '"$WORK_DIR"'|' buf.gen.yaml)
+(cd "$REPO_ROOT" && buf generate --template "$CHECK_TEMPLATE") >/dev/null 2>&1
+
+FILES_JSON="[]"
+DRIFTED=0
+
+for f in $(find "$WORK_DIR/proto" -name '*.go' -type f | sort); do
+  REL=${f#"$WORK_DIR/proto/"}
+  COMMITTED="$SDK_ROOT/proto/$REL"
+
+  if [ ! -f "$COMMITTED" ]; then
+    FILES_JSON=$(echo "$FILES_JSON" | jq --arg n "$REL" '. + [{"name":$n,"status":"added","diff_lines":0}]')
+    DRIFTED=$((DRIFTED + 1))
+  else
+    DIFF_LINES=$(diff -u "$COMMITTED" "$f" 2>/dev/null | wc -l | tr -d ' ')
+    if [ "$DIFF_LINES" -gt 0 ]; then
+      FILES_JSON=$(echo "$FILES_JSON" | jq --arg n "$REL" --argjson d "$DIFF_LINES" '. + [{"name":$n,"status":"modified","diff_lines":$d}]')
+      DRIFTED=$((DRIFTED + 1))
+    fi
+  fi
+done
+
+for f in $(find "$SDK_ROOT/proto" -name '*.go' -type f | sort); do
+  REL=${f#"$SDK_ROOT/proto/"}
+  REGEN="$WORK_DIR/proto/$REL"
+  if [ ! -f "$REGEN" ]; then
+    FILES_JSON=$(echo "$FILES_JSON" | jq --arg n "$REL" '. + [{"name":$n,"status":"removed","diff_lines":0}]')
+    DRIFTED=$((DRIFTED + 1))
+  fi
+done
+
+if [ "$DRIFTED" -eq 0 ]; then
+  SYNCED=true
+  SUMMARY="all files synced"
+else
+  SYNCED=false
+  SUMMARY="${DRIFTED} file(s) drifted"
+fi
+
+jq -n -c \
+  --arg sdk "go" \
+  --argjson synced "$SYNCED" \
+  --argjson files "$FILES_JSON" \
+  --arg summary "$SUMMARY" \
+  '{sdk:$sdk, synced:$synced, files:$files, summary:$summary}'
+
+[ "$SYNCED" = "true" ] && exit 0 || exit 1
+"""
+hide = true
+
+["go:proto:build-check"]
+description = "Run full Go SDK proto sync, generate, build, and test pipeline"
+dir = "sdk/go"
+run = 'bash ../../tasks/scripts/sdk_build_check.sh go gen=go:proto:gen build=go:build test=go:test'
+hide = true
