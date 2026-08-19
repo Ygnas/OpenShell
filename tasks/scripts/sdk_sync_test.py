@@ -8,81 +8,17 @@ Run via: uv run --no-project --with pytest pytest tasks/scripts/sdk_sync_test.py
 
 from __future__ import annotations
 
-import os
 import subprocess
 from unittest.mock import patch
 
 from sdk_sync import (
-    generate_dashboard,
     generate_issue_body,
     manage_issue,
-    wiki_push,
 )
 
 
 def _mock_run(returncode=0, stdout="", stderr=""):
     return subprocess.CompletedProcess([], returncode, stdout=stdout, stderr=stderr)
-
-
-class TestGenerateDashboard:
-    def test_all_synced(self):
-        drift = [
-            {"sdk": "go", "synced": True, "files": [], "summary": "all files synced"}
-        ]
-        md = generate_dashboard(drift, [])
-        assert "synced" in md
-        assert "n/a" in md
-        assert "Drift Details" not in md
-
-    def test_drifted_with_build_failure(self):
-        drift = [
-            {
-                "sdk": "go",
-                "synced": False,
-                "files": [
-                    {
-                        "name": "openshellv1/openshell.pb.go",
-                        "status": "modified",
-                        "diff_lines": 5,
-                    }
-                ],
-                "summary": "1 file(s) drifted",
-            }
-        ]
-        build = [
-            {"sdk": "go", "success": False, "failed_step": "build", "log": "error"}
-        ]
-        md = generate_dashboard(drift, build)
-        assert "**drifted**" in md
-        assert "**failing**" in md
-        assert "Drift Details" in md
-
-    def test_issue_link_formatting(self):
-        drift = [
-            {
-                "sdk": "go",
-                "synced": False,
-                "files": [],
-                "summary": "drifted",
-                "issue_url": "https://github.com/NVIDIA/OpenShell/issues/123",
-            }
-        ]
-        md = generate_dashboard(drift, [])
-        assert "[#123]" in md
-
-    def test_multiple_sdks(self):
-        drift = [
-            {"sdk": "go", "synced": True, "files": [], "summary": "all files synced"},
-            {
-                "sdk": "typescript",
-                "synced": False,
-                "files": [],
-                "summary": "typecheck failed",
-            },
-        ]
-        md = generate_dashboard(drift, [])
-        assert "Go" in md
-        assert "TypeScript" in md
 
 
 class TestGenerateIssueBody:
@@ -186,47 +122,6 @@ class TestGenerateIssueBody:
         agent_section = md.split("## Agent Instructions")[1]
         assert "`test`" in agent_section
         assert "fails at" in agent_section.lower()
-
-
-class TestWikiPush:
-    @patch("sdk_sync._run_cmd")
-    @patch.dict("os.environ", {"GITHUB_TOKEN": "test-token"})
-    def test_successful_push(self, mock_run, tmp_path):
-        content = tmp_path / "dashboard.md"
-        content.write_text("# Dashboard")
-
-        mock_run.side_effect = [
-            _mock_run(0),  # git clone
-            _mock_run(0),  # git config user.name
-            _mock_run(0),  # git config user.email
-            _mock_run(0),  # git add
-            _mock_run(1),  # git diff --cached --quiet (has changes)
-            _mock_run(0),  # git commit
-            _mock_run(0),  # git push
-        ]
-
-        result = wiki_push(content, "SDK-Sync-Status", "NVIDIA/OpenShell")
-        assert result["success"] is True
-
-    @patch("sdk_sync._run_cmd")
-    @patch.dict("os.environ", {"GITHUB_TOKEN": "test-token"})
-    def test_clone_failure(self, mock_run, tmp_path):
-        content = tmp_path / "dashboard.md"
-        content.write_text("# Dashboard")
-        mock_run.return_value = _mock_run(128)
-
-        result = wiki_push(content, "SDK-Sync-Status", "NVIDIA/OpenShell")
-        assert result["success"] is False
-        assert "clone" in result["reason"].lower()
-
-    @patch.dict("os.environ", {}, clear=True)
-    def test_missing_token(self, tmp_path):
-        content = tmp_path / "dashboard.md"
-        content.write_text("# Dashboard")
-        os.environ.pop("GITHUB_TOKEN", None)
-        result = wiki_push(content, "SDK-Sync-Status", "NVIDIA/OpenShell")
-        assert result["success"] is False
-        assert "TOKEN" in result["reason"]
 
 
 class TestManageIssue:

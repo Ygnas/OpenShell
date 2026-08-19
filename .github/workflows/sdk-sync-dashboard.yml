@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-name: SDK Sync Dashboard
+name: SDK Proto Sync
 
 on:
   schedule:
@@ -13,12 +13,12 @@ env:
 
 permissions:
   actions: read
-  contents: write
+  contents: read
   packages: read
   issues: write
 
 concurrency:
-  group: sdk-sync-dashboard
+  group: sdk-proto-sync
   cancel-in-progress: true
 
 jobs:
@@ -108,45 +108,6 @@ jobs:
             echo "report={}" >> "$GITHUB_OUTPUT"
           fi
           [ "$BUILD_OK" = "true" ] && echo "build_failed=false" >> "$GITHUB_OUTPUT" || echo "build_failed=true" >> "$GITHUB_OUTPUT"
-
-  wiki_dashboard:
-    name: Update Wiki Dashboard
-    needs: sdk_sync_check
-    if: always() && needs.sdk_sync_check.result != 'cancelled'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Install tools
-        run: mise install --locked
-
-      - name: Generate and push dashboard
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GO_DRIFT_REPORT: ${{ needs.sdk_sync_check.outputs.go_drift_report }}
-          GO_BUILD_REPORT: ${{ needs.sdk_sync_check.outputs.go_build_report }}
-          TS_DRIFT_REPORT: ${{ needs.sdk_sync_check.outputs.ts_drift_report }}
-          TS_BUILD_REPORT: ${{ needs.sdk_sync_check.outputs.ts_build_report }}
-        run: |
-          DRIFT_REPORTS=$(jq -n -c \
-            --argjson go "${GO_DRIFT_REPORT:-{}}" \
-            --argjson ts "${TS_DRIFT_REPORT:-{}}" \
-            '[$go, $ts]')
-          BUILD_REPORTS=$(jq -n -c \
-            --argjson go "${GO_BUILD_REPORT:-{}}" \
-            --argjson ts "${TS_BUILD_REPORT:-{}}" \
-            '[$go, $ts] | map(select(.sdk != null))')
-
-          DASHBOARD=$(mktemp)
-          uv run python tasks/scripts/sdk_sync.py dashboard \
-            --drift-report "$DRIFT_REPORTS" \
-            --build-report "$BUILD_REPORTS" \
-            --output "$DASHBOARD"
-
-          uv run python tasks/scripts/sdk_sync.py wiki-push \
-            --content "$DASHBOARD" \
-            --page-name SDK-Sync-Status \
-            --repo "$GITHUB_REPOSITORY"
 
   issue_management:
     name: Manage Drift Issue (${{ matrix.sdk.name }})

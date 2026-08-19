@@ -7,12 +7,10 @@
 
 Drift detection is handled by per-SDK mise tasks (go:proto:drift,
 sdk:ts:proto:drift) which output JSON DriftReport objects. This CLI
-provides the workflow integration layer: dashboards, issue management,
-and wiki updates.
+provides the workflow integration layer: issue management when drift
+is detected and auto-closing when it resolves.
 
 Subcommands:
-  dashboard      Generate wiki dashboard markdown from drift/build reports
-  wiki-push      Clone wiki repo, update a page, commit, push
   manage-issue   Create or update a GitHub drift issue (deduplicates by label)
 """
 
@@ -20,13 +18,8 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
-import shutil
 import subprocess
 import sys
-import tempfile
-from datetime import UTC, datetime
-from pathlib import Path
 
 SDK_CONFIGS = {
     "go": {
@@ -54,62 +47,6 @@ SDK_CONFIGS = {
 
 def _sdk_display_name(sdk: str) -> str:
     return SDK_CONFIGS[sdk]["display_name"]
-
-
-def generate_dashboard(
-    drift_reports: list[dict],
-    build_reports: list[dict],
-) -> str:
-    timestamp = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
-
-    lines = [
-        "# SDK Sync Status",
-        "",
-        f"*Last updated: {timestamp}*",
-        "",
-        "## Overview",
-        "",
-        "| SDK | Proto Synced | Build | Issue |",
-        "|-----|-------------|-------|-------|",
-    ]
-
-    drift_details: list[str] = []
-
-    for drift in drift_reports:
-        sdk = drift.get("sdk", "unknown")
-        synced = drift.get("synced", True)
-        build = _find_build(build_reports, sdk)
-
-        if synced:
-            proto_status = "synced"
-            build_status = "n/a"
-            issue_link = ""
-        else:
-            proto_status = "**drifted**"
-            if build and not build.get("success", True):
-                build_status = "**failing**"
-            else:
-                build_status = "passing"
-            issue_link = drift.get("issue_url", "")
-            if issue_link:
-                issue_num = issue_link.rstrip("/").split("/")[-1]
-                issue_link = f"[#{issue_num}]({issue_link})"
-
-        lines.append(
-            f"| {_sdk_display_name(sdk)} | {proto_status} | {build_status} | {issue_link} |"
-        )
-
-        if not synced:
-            drift_details.extend(_format_drift_details(drift))
-
-    if drift_details:
-        lines.append("")
-        lines.append("## Drift Details")
-        lines.append("")
-        lines.extend(drift_details)
-
-    lines.append("")
-    return "\n".join(lines)
 
 
 def generate_issue_body(
@@ -245,10 +182,6 @@ def generate_issue_body(
 # --- helpers ---
 
 
-def _find_build(build_reports: list[dict], sdk: str) -> dict | None:
-    return next((b for b in build_reports if b.get("sdk") == sdk), None)
-
-
 def _render_file_table(files: list[dict]) -> list[str]:
     lines = [
         "| File | Status | Diff Lines |",
@@ -256,21 +189,6 @@ def _render_file_table(files: list[dict]) -> list[str]:
     ]
     for f in files:
         lines.append(f"| `{f['name']}` | {f['status']} | {f['diff_lines']} |")
-    return lines
-
-
-def _format_drift_details(drift: dict) -> list[str]:
-    sdk = drift.get("sdk", "unknown")
-    lines = [
-        f"### {_sdk_display_name(sdk)} SDK",
-        "",
-        f"**Status**: {drift.get('summary', 'unknown')}",
-        "",
-    ]
-    files = drift.get("files", [])
-    if files:
-        lines.extend(_render_file_table(files))
-        lines.append("")
     return lines
 
 
@@ -334,56 +252,6 @@ def _find_open_issue(repo: str, label: str) -> dict | None:
 
 
 # --- public functions ---
-
-
-def wiki_push(content_path: Path, page_name: str, repo: str) -> dict:
-    token = os.environ.get("GITHUB_TOKEN", "")
-    if not token:
-        return {"success": False, "reason": "GITHUB_TOKEN not set"}
-
-    work_dir = tempfile.mkdtemp()
-    try:
-        clone_url = f"https://x-access-token:{token}@github.com/{repo}.wiki.git"
-        result = _run_cmd(["git", "clone", clone_url, work_dir], capture=True)
-        if result.returncode != 0:
-            return {
-                "success": False,
-                "reason": "Failed to clone wiki repository",
-            }
-
-        shutil.copy2(str(content_path), str(Path(work_dir) / f"{page_name}.md"))
-
-        _run_cmd(["git", "config", "user.name", "github-actions[bot]"], cwd=work_dir)
-        _run_cmd(
-            [
-                "git",
-                "config",
-                "user.email",
-                "github-actions[bot]@users.noreply.github.com",
-            ],
-            cwd=work_dir,
-        )
-        _run_cmd(["git", "add", f"{page_name}.md"], cwd=work_dir)
-
-        diff = _run_cmd(
-            ["git", "diff", "--cached", "--quiet"], cwd=work_dir, capture=True
-        )
-        if diff.returncode == 0:
-            return {"success": True, "reason": "No changes to dashboard"}
-
-        timestamp = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
-        _run_cmd(
-            ["git", "commit", "-m", f"Update {page_name} ({timestamp})"],
-            cwd=work_dir,
-        )
-
-        push = _run_cmd(["git", "push"], cwd=work_dir, capture=True)
-        if push.returncode != 0:
-            return {"success": False, "reason": "Failed to push wiki update"}
-
-        return {"success": True, "reason": "Wiki updated"}
-    finally:
-        shutil.rmtree(work_dir, ignore_errors=True)
 
 
 def manage_issue(
@@ -456,36 +324,6 @@ def _load_json_arg(value: str) -> dict | list:
     return json.loads(value)
 
 
-def cmd_dashboard(args: argparse.Namespace) -> int:
-    drift_reports = _load_json_arg(args.drift_report)
-    if not isinstance(drift_reports, list):
-        drift_reports = [drift_reports]
-
-    build_reports: list[dict] = []
-    if args.build_report:
-        br = _load_json_arg(args.build_report)
-        build_reports = br if isinstance(br, list) else [br]
-
-    md = generate_dashboard(drift_reports, build_reports)
-
-    if args.output:
-        Path(args.output).write_text(md)
-        print(f"Dashboard written to {args.output}")
-    else:
-        print(md)
-    return 0
-
-
-def cmd_wiki_push(args: argparse.Namespace) -> int:
-    content = Path(args.content)
-    if not content.exists():
-        print(f"ERROR: Content file not found: {content}", file=sys.stderr)
-        return 1
-    result = wiki_push(content, args.page_name, args.repo)
-    print(json.dumps(result))
-    return 0
-
-
 def cmd_manage_issue(args: argparse.Namespace) -> int:
     drift_report = _load_json_arg(args.drift_report)
     build_report = None
@@ -503,20 +341,6 @@ def main() -> int:
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    db = sub.add_parser("dashboard", help="Generate wiki dashboard markdown")
-    db.add_argument(
-        "--drift-report",
-        required=True,
-        help="Drift report JSON (string or - for stdin)",
-    )
-    db.add_argument("--build-report", help="Build report JSON (string or - for stdin)")
-    db.add_argument("--output", help="Output file path (stdout if omitted)")
-
-    wp = sub.add_parser("wiki-push", help="Push a page to the GitHub wiki")
-    wp.add_argument("--content", required=True, help="Path to markdown file to push")
-    wp.add_argument("--page-name", required=True, help="Wiki page name (without .md)")
-    wp.add_argument("--repo", required=True, help="GitHub repo (owner/name)")
-
     mi = sub.add_parser("manage-issue", help="Create or update a drift issue")
     mi.add_argument("--drift-report", required=True, help="Drift report JSON")
     mi.add_argument("--build-report", help="Build report JSON")
@@ -526,8 +350,6 @@ def main() -> int:
 
     args = parser.parse_args()
     handlers = {
-        "dashboard": cmd_dashboard,
-        "wiki-push": cmd_wiki_push,
         "manage-issue": cmd_manage_issue,
     }
     return handlers[args.command](args)
