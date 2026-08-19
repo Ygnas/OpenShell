@@ -133,13 +133,22 @@ jobs:
           TS_DRIFT_REPORT: ${{ needs.sdk_sync_check.outputs.ts_drift_report }}
           TS_BUILD_REPORT: ${{ needs.sdk_sync_check.outputs.ts_build_report }}
         run: |
+          GO_DRIFT="${GO_DRIFT_REPORT:-"{}"}"
+          TS_DRIFT="${TS_DRIFT_REPORT:-"{}"}"
+          GO_BUILD="${GO_BUILD_REPORT:-"{}"}"
+          TS_BUILD="${TS_BUILD_REPORT:-"{}"}"
+          [ -z "$GO_DRIFT" ] && GO_DRIFT="{}"
+          [ -z "$TS_DRIFT" ] && TS_DRIFT="{}"
+          [ -z "$GO_BUILD" ] && GO_BUILD="{}"
+          [ -z "$TS_BUILD" ] && TS_BUILD="{}"
+
           DRIFT_REPORTS=$(jq -n -c \
-            --argjson go "${GO_DRIFT_REPORT:-{}}" \
-            --argjson ts "${TS_DRIFT_REPORT:-{}}" \
+            --argjson go "$GO_DRIFT" \
+            --argjson ts "$TS_DRIFT" \
             '[$go, $ts]')
           BUILD_REPORTS=$(jq -n -c \
-            --argjson go "${GO_BUILD_REPORT:-{}}" \
-            --argjson ts "${TS_BUILD_REPORT:-{}}" \
+            --argjson go "$GO_BUILD" \
+            --argjson ts "$TS_BUILD" \
             '[$go, $ts] | map(select(.sdk != null))')
 
           DASHBOARD=$(mktemp)
