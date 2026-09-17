@@ -6,6 +6,7 @@ syntax = "proto3";
 package openshell.sandbox.v1;
 
 import "google/protobuf/struct.proto";
+import "google/protobuf/duration.proto";
 
 // Sandbox-supervisor configuration and policy messages.
 //
@@ -197,22 +198,13 @@ message NetworkEndpoint {
 }
 
 // MCP options are grouped so MCP-specific policy can grow without adding more
-// top-level NetworkEndpoint fields. Current enforcement targets the active
-// 2025-11-25 Streamable HTTP/tools behavior, while preserving space for
-// version-profile policy if OpenShell adopts 2026-07-28 draft behavior later.
-//
-// Planned policy extensions should use OpenShell-owned static definitions for
-// MCP method/version profiles rather than treating dependency enums as the
-// policy contract. Candidate profile checks include request metadata/header
-// validation, response/SSE introspection, trusted annotation handling,
-// resultType/cache metadata validation, x-mcp-header tool-definition checks,
-// and subscriptions/listen handling.
+// top-level NetworkEndpoint fields. OpenShell owns the supported revision
+// profiles instead of treating dependency enums as the policy contract.
 //
 // Sources:
-// - https://modelcontextprotocol.io/specification/2025-11-25/server/tools
-// - https://modelcontextprotocol.io/specification/draft/changelog
-// - https://modelcontextprotocol.io/specification/draft/basic/transports/streamable-http
-// - https://modelcontextprotocol.io/specification/draft/server/tools
+// - https://modelcontextprotocol.io/specification/2025-03-26/basic/transports
+// - https://modelcontextprotocol.io/specification/2025-06-18/basic/transports
+// - https://modelcontextprotocol.io/specification/2025-11-25/basic/transports
 message McpOptions {
   // Hardening boundary for tools/call params.name. When unset or true, the
   // supervisor enforces the MCP recommended tool-name syntax
@@ -226,6 +218,19 @@ message McpOptions {
   // MCP-family methods at the method layer unless a tool-name policy narrows
   // tools/call. When unset or false, explicit method rules are required.
   optional bool allow_all_known_mcp_methods = 2;
+  // Exact MCP protocol revisions accepted by the endpoint's policy schema.
+  // Authors may omit this field. Because proto3 repeated fields do not retain
+  // presence, omission reaches protobuf ingress as an empty list. Checked
+  // normalization materializes OpenShell's pinned default revision
+  // "2025-11-25" before producing canonical downstream state, which is always
+  // nonempty.
+  //
+  // An explicit nonempty list remains an exact allowlist. Duplicates, moving
+  // aliases such as "draft" and "latest", and unknown dates are invalid.
+  // Normalization stores valid values in canonical semantic order. These
+  // values identify core revisions; they do not enable separate SEP overlays
+  // or select runtime parsing and forwarding behavior.
+  repeated string versions = 3;
 }
 
 // Trusted GraphQL operation classification.
@@ -307,8 +312,8 @@ message L7QueryMatcher {
 // A binary identity for network policy matching.
 message NetworkBinary {
   string path = 1;
-  // Deprecated: the harness concept has been removed. This field is ignored.
-  bool harness = 2 [deprecated = true];
+  reserved 2;
+  reserved "harness";
 }
 
 // Request to get sandbox settings by sandbox ID.
@@ -399,6 +404,8 @@ message GetSandboxConfigResponse {
 // Connection details for one operator-registered supervisor middleware service.
 // V1 supports plaintext and server-authenticated TLS gRPC.
 message SupervisorMiddlewareService {
+  reserved 4;
+  reserved "timeout";
   // Operator-owned registration name used by policy attachments and diagnostics.
   string name = 1;
   // gRPC endpoint reachable from the sandbox supervisor.
@@ -406,10 +413,9 @@ message SupervisorMiddlewareService {
   // Operator-owned logical payload limit applied to every binding exposed by
   // the service. This caps HTTP bodies and complete WebSocket messages.
   uint64 max_payload_bytes = 3;
-  // Default RPC timeout for this service. Empty uses the platform default of
-  // 500ms. Values use an integer with an `ms` or `s` suffix and must be
-  // between 10ms and 30s.
-  string timeout = 4;
+  // Default RPC timeout for this service. Absence uses the platform default of
+  // 500ms. Values must be between 10ms and 30s.
+  google.protobuf.Duration request_timeout = 104;
   // PEM-encoded trust roots loaded by the gateway from the operator-configured
   // tls_ca_cert_path. Empty uses the platform trust store.
   bytes tls_ca_cert_pem = 5;

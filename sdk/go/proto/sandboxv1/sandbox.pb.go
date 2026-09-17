@@ -12,6 +12,7 @@ package sandboxv1
 import (
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
+	durationpb "google.golang.org/protobuf/types/known/durationpb"
 	structpb "google.golang.org/protobuf/types/known/structpb"
 	reflect "reflect"
 	sync "sync"
@@ -955,22 +956,13 @@ func (x *NetworkEndpoint) GetProviderCredentialed() bool {
 }
 
 // MCP options are grouped so MCP-specific policy can grow without adding more
-// top-level NetworkEndpoint fields. Current enforcement targets the active
-// 2025-11-25 Streamable HTTP/tools behavior, while preserving space for
-// version-profile policy if OpenShell adopts 2026-07-28 draft behavior later.
-//
-// Planned policy extensions should use OpenShell-owned static definitions for
-// MCP method/version profiles rather than treating dependency enums as the
-// policy contract. Candidate profile checks include request metadata/header
-// validation, response/SSE introspection, trusted annotation handling,
-// resultType/cache metadata validation, x-mcp-header tool-definition checks,
-// and subscriptions/listen handling.
+// top-level NetworkEndpoint fields. OpenShell owns the supported revision
+// profiles instead of treating dependency enums as the policy contract.
 //
 // Sources:
-// - https://modelcontextprotocol.io/specification/2025-11-25/server/tools
-// - https://modelcontextprotocol.io/specification/draft/changelog
-// - https://modelcontextprotocol.io/specification/draft/basic/transports/streamable-http
-// - https://modelcontextprotocol.io/specification/draft/server/tools
+// - https://modelcontextprotocol.io/specification/2025-03-26/basic/transports
+// - https://modelcontextprotocol.io/specification/2025-06-18/basic/transports
+// - https://modelcontextprotocol.io/specification/2025-11-25/basic/transports
 type McpOptions struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Hardening boundary for tools/call params.name. When unset or true, the
@@ -985,8 +977,21 @@ type McpOptions struct {
 	// MCP-family methods at the method layer unless a tool-name policy narrows
 	// tools/call. When unset or false, explicit method rules are required.
 	AllowAllKnownMcpMethods *bool `protobuf:"varint,2,opt,name=allow_all_known_mcp_methods,json=allowAllKnownMcpMethods,proto3,oneof" json:"allow_all_known_mcp_methods,omitempty"`
-	unknownFields           protoimpl.UnknownFields
-	sizeCache               protoimpl.SizeCache
+	// Exact MCP protocol revisions accepted by the endpoint's policy schema.
+	// Authors may omit this field. Because proto3 repeated fields do not retain
+	// presence, omission reaches protobuf ingress as an empty list. Checked
+	// normalization materializes OpenShell's pinned default revision
+	// "2025-11-25" before producing canonical downstream state, which is always
+	// nonempty.
+	//
+	// An explicit nonempty list remains an exact allowlist. Duplicates, moving
+	// aliases such as "draft" and "latest", and unknown dates are invalid.
+	// Normalization stores valid values in canonical semantic order. These
+	// values identify core revisions; they do not enable separate SEP overlays
+	// or select runtime parsing and forwarding behavior.
+	Versions      []string `protobuf:"bytes,3,rep,name=versions,proto3" json:"versions,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *McpOptions) Reset() {
@@ -1031,6 +1036,13 @@ func (x *McpOptions) GetAllowAllKnownMcpMethods() bool {
 		return *x.AllowAllKnownMcpMethods
 	}
 	return false
+}
+
+func (x *McpOptions) GetVersions() []string {
+	if x != nil {
+		return x.Versions
+	}
+	return nil
 }
 
 // Trusted GraphQL operation classification.
@@ -1428,12 +1440,8 @@ func (x *L7QueryMatcher) GetAny() []string {
 
 // A binary identity for network policy matching.
 type NetworkBinary struct {
-	state protoimpl.MessageState `protogen:"open.v1"`
-	Path  string                 `protobuf:"bytes,1,opt,name=path,proto3" json:"path,omitempty"`
-	// Deprecated: the harness concept has been removed. This field is ignored.
-	//
-	// Deprecated: Marked as deprecated in sandbox.proto.
-	Harness       bool `protobuf:"varint,2,opt,name=harness,proto3" json:"harness,omitempty"`
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Path          string                 `protobuf:"bytes,1,opt,name=path,proto3" json:"path,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1473,14 +1481,6 @@ func (x *NetworkBinary) GetPath() string {
 		return x.Path
 	}
 	return ""
-}
-
-// Deprecated: Marked as deprecated in sandbox.proto.
-func (x *NetworkBinary) GetHarness() bool {
-	if x != nil {
-		return x.Harness
-	}
-	return false
 }
 
 // Request to get sandbox settings by sandbox ID.
@@ -1955,10 +1955,9 @@ type SupervisorMiddlewareService struct {
 	// Operator-owned logical payload limit applied to every binding exposed by
 	// the service. This caps HTTP bodies and complete WebSocket messages.
 	MaxPayloadBytes uint64 `protobuf:"varint,3,opt,name=max_payload_bytes,json=maxPayloadBytes,proto3" json:"max_payload_bytes,omitempty"`
-	// Default RPC timeout for this service. Empty uses the platform default of
-	// 500ms. Values use an integer with an `ms` or `s` suffix and must be
-	// between 10ms and 30s.
-	Timeout string `protobuf:"bytes,4,opt,name=timeout,proto3" json:"timeout,omitempty"`
+	// Default RPC timeout for this service. Absence uses the platform default of
+	// 500ms. Values must be between 10ms and 30s.
+	RequestTimeout *durationpb.Duration `protobuf:"bytes,104,opt,name=request_timeout,json=requestTimeout,proto3" json:"request_timeout,omitempty"`
 	// PEM-encoded trust roots loaded by the gateway from the operator-configured
 	// tls_ca_cert_path. Empty uses the platform trust store.
 	TlsCaCertPem []byte `protobuf:"bytes,5,opt,name=tls_ca_cert_pem,json=tlsCaCertPem,proto3" json:"tls_ca_cert_pem,omitempty"`
@@ -2026,11 +2025,11 @@ func (x *SupervisorMiddlewareService) GetMaxPayloadBytes() uint64 {
 	return 0
 }
 
-func (x *SupervisorMiddlewareService) GetTimeout() string {
+func (x *SupervisorMiddlewareService) GetRequestTimeout() *durationpb.Duration {
 	if x != nil {
-		return x.Timeout
+		return x.RequestTimeout
 	}
-	return ""
+	return nil
 }
 
 func (x *SupervisorMiddlewareService) GetTlsCaCertPem() []byte {
@@ -2058,7 +2057,7 @@ var File_sandbox_proto protoreflect.FileDescriptor
 
 const file_sandbox_proto_rawDesc = "" +
 	"\n" +
-	"\rsandbox.proto\x12\x14openshell.sandbox.v1\x1a\x1cgoogle/protobuf/struct.proto\"\xa8\x05\n" +
+	"\rsandbox.proto\x12\x14openshell.sandbox.v1\x1a\x1cgoogle/protobuf/struct.proto\x1a\x1egoogle/protobuf/duration.proto\"\xa8\x05\n" +
 	"\rSandboxPolicy\x12\x18\n" +
 	"\aversion\x18\x01 \x01(\rR\aversion\x12F\n" +
 	"\n" +
@@ -2136,11 +2135,12 @@ const file_sandbox_proto_rawDesc = "" +
 	"\x15provider_credentialed\x18\x1a \x01(\bR\x14providerCredentialed\x1ar\n" +
 	"\x1cGraphqlPersistedQueriesEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12<\n" +
-	"\x05value\x18\x02 \x01(\v2&.openshell.sandbox.v1.GraphqlOperationR\x05value:\x028\x01\"\xb6\x01\n" +
+	"\x05value\x18\x02 \x01(\v2&.openshell.sandbox.v1.GraphqlOperationR\x05value:\x028\x01\"\xd2\x01\n" +
 	"\n" +
 	"McpOptions\x12/\n" +
 	"\x11strict_tool_names\x18\x01 \x01(\bH\x00R\x0fstrictToolNames\x88\x01\x01\x12A\n" +
-	"\x1ballow_all_known_mcp_methods\x18\x02 \x01(\bH\x01R\x17allowAllKnownMcpMethods\x88\x01\x01B\x14\n" +
+	"\x1ballow_all_known_mcp_methods\x18\x02 \x01(\bH\x01R\x17allowAllKnownMcpMethods\x88\x01\x01\x12\x1a\n" +
+	"\bversions\x18\x03 \x03(\tR\bversionsB\x14\n" +
 	"\x12_strict_tool_namesB\x1e\n" +
 	"\x1c_allow_all_known_mcp_methods\"x\n" +
 	"\x10GraphqlOperation\x12%\n" +
@@ -2184,10 +2184,9 @@ const file_sandbox_proto_rawDesc = "" +
 	"\x05value\x18\x02 \x01(\v2$.openshell.sandbox.v1.L7QueryMatcherR\x05value:\x028\x01J\x04\b\b\x10\t\"6\n" +
 	"\x0eL7QueryMatcher\x12\x12\n" +
 	"\x04glob\x18\x01 \x01(\tR\x04glob\x12\x10\n" +
-	"\x03any\x18\x02 \x03(\tR\x03any\"A\n" +
+	"\x03any\x18\x02 \x03(\tR\x03any\"2\n" +
 	"\rNetworkBinary\x12\x12\n" +
-	"\x04path\x18\x01 \x01(\tR\x04path\x12\x1c\n" +
-	"\aharness\x18\x02 \x01(\bB\x02\x18\x01R\aharness\"8\n" +
+	"\x04path\x18\x01 \x01(\tR\x04pathJ\x04\b\x02\x10\x03R\aharness\"8\n" +
 	"\x17GetSandboxConfigRequest\x12\x1d\n" +
 	"\n" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\"\x19\n" +
@@ -2226,15 +2225,15 @@ const file_sandbox_proto_rawDesc = "" +
 	" extension_authentication_enabled\x18\f \x01(\bR\x1eextensionAuthenticationEnabled\x1ac\n" +
 	"\rSettingsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12<\n" +
-	"\x05value\x18\x02 \x01(\v2&.openshell.sandbox.v1.EffectiveSettingR\x05value:\x028\x01\"\x99\x02\n" +
+	"\x05value\x18\x02 \x01(\v2&.openshell.sandbox.v1.EffectiveSettingR\x05value:\x028\x01\"\xd2\x02\n" +
 	"\x1bSupervisorMiddlewareService\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12#\n" +
 	"\rgrpc_endpoint\x18\x02 \x01(\tR\fgrpcEndpoint\x12*\n" +
-	"\x11max_payload_bytes\x18\x03 \x01(\x04R\x0fmaxPayloadBytes\x12\x18\n" +
-	"\atimeout\x18\x04 \x01(\tR\atimeout\x12%\n" +
+	"\x11max_payload_bytes\x18\x03 \x01(\x04R\x0fmaxPayloadBytes\x12B\n" +
+	"\x0frequest_timeout\x18h \x01(\v2\x19.google.protobuf.DurationR\x0erequestTimeout\x12%\n" +
 	"\x0ftls_ca_cert_pem\x18\x05 \x01(\fR\ftlsCaCertPem\x12\x1a\n" +
 	"\baudience\x18\x06 \x01(\tR\baudience\x128\n" +
-	"\x18allow_insecure_transport\x18\a \x01(\bR\x16allowInsecureTransport*b\n" +
+	"\x18allow_insecure_transport\x18\a \x01(\bR\x16allowInsecureTransportJ\x04\b\x04\x10\x05R\atimeout*b\n" +
 	"\fSettingScope\x12\x1d\n" +
 	"\x19SETTING_SCOPE_UNSPECIFIED\x10\x00\x12\x19\n" +
 	"\x15SETTING_SCOPE_SANDBOX\x10\x01\x12\x18\n" +
@@ -2294,6 +2293,7 @@ var file_sandbox_proto_goTypes = []any{
 	nil,                                 // 32: openshell.sandbox.v1.GetGatewayConfigResponse.SettingsEntry
 	nil,                                 // 33: openshell.sandbox.v1.GetSandboxConfigResponse.SettingsEntry
 	(*structpb.Struct)(nil),             // 34: google.protobuf.Struct
+	(*durationpb.Duration)(nil),         // 35: google.protobuf.Duration
 }
 var file_sandbox_proto_depIdxs = []int32{
 	3,  // 0: openshell.sandbox.v1.SandboxPolicy.filesystem:type_name -> openshell.sandbox.v1.FilesystemPolicy
@@ -2322,20 +2322,21 @@ var file_sandbox_proto_depIdxs = []int32{
 	33, // 23: openshell.sandbox.v1.GetSandboxConfigResponse.settings:type_name -> openshell.sandbox.v1.GetSandboxConfigResponse.SettingsEntry
 	1,  // 24: openshell.sandbox.v1.GetSandboxConfigResponse.policy_source:type_name -> openshell.sandbox.v1.PolicySource
 	24, // 25: openshell.sandbox.v1.GetSandboxConfigResponse.supervisor_middleware_services:type_name -> openshell.sandbox.v1.SupervisorMiddlewareService
-	6,  // 26: openshell.sandbox.v1.SandboxPolicy.NetworkPoliciesEntry.value:type_name -> openshell.sandbox.v1.NetworkPolicyRule
-	7,  // 27: openshell.sandbox.v1.SandboxPolicy.NetworkMiddlewaresEntry.value:type_name -> openshell.sandbox.v1.NetworkMiddlewareConfig
-	12, // 28: openshell.sandbox.v1.NetworkEndpoint.GraphqlPersistedQueriesEntry.value:type_name -> openshell.sandbox.v1.GraphqlOperation
-	16, // 29: openshell.sandbox.v1.L7DenyRule.QueryEntry.value:type_name -> openshell.sandbox.v1.L7QueryMatcher
-	16, // 30: openshell.sandbox.v1.L7DenyRule.ParamsEntry.value:type_name -> openshell.sandbox.v1.L7QueryMatcher
-	16, // 31: openshell.sandbox.v1.L7Allow.QueryEntry.value:type_name -> openshell.sandbox.v1.L7QueryMatcher
-	16, // 32: openshell.sandbox.v1.L7Allow.ParamsEntry.value:type_name -> openshell.sandbox.v1.L7QueryMatcher
-	21, // 33: openshell.sandbox.v1.GetGatewayConfigResponse.SettingsEntry.value:type_name -> openshell.sandbox.v1.SettingValue
-	22, // 34: openshell.sandbox.v1.GetSandboxConfigResponse.SettingsEntry.value:type_name -> openshell.sandbox.v1.EffectiveSetting
-	35, // [35:35] is the sub-list for method output_type
-	35, // [35:35] is the sub-list for method input_type
-	35, // [35:35] is the sub-list for extension type_name
-	35, // [35:35] is the sub-list for extension extendee
-	0,  // [0:35] is the sub-list for field type_name
+	35, // 26: openshell.sandbox.v1.SupervisorMiddlewareService.request_timeout:type_name -> google.protobuf.Duration
+	6,  // 27: openshell.sandbox.v1.SandboxPolicy.NetworkPoliciesEntry.value:type_name -> openshell.sandbox.v1.NetworkPolicyRule
+	7,  // 28: openshell.sandbox.v1.SandboxPolicy.NetworkMiddlewaresEntry.value:type_name -> openshell.sandbox.v1.NetworkMiddlewareConfig
+	12, // 29: openshell.sandbox.v1.NetworkEndpoint.GraphqlPersistedQueriesEntry.value:type_name -> openshell.sandbox.v1.GraphqlOperation
+	16, // 30: openshell.sandbox.v1.L7DenyRule.QueryEntry.value:type_name -> openshell.sandbox.v1.L7QueryMatcher
+	16, // 31: openshell.sandbox.v1.L7DenyRule.ParamsEntry.value:type_name -> openshell.sandbox.v1.L7QueryMatcher
+	16, // 32: openshell.sandbox.v1.L7Allow.QueryEntry.value:type_name -> openshell.sandbox.v1.L7QueryMatcher
+	16, // 33: openshell.sandbox.v1.L7Allow.ParamsEntry.value:type_name -> openshell.sandbox.v1.L7QueryMatcher
+	21, // 34: openshell.sandbox.v1.GetGatewayConfigResponse.SettingsEntry.value:type_name -> openshell.sandbox.v1.SettingValue
+	22, // 35: openshell.sandbox.v1.GetSandboxConfigResponse.SettingsEntry.value:type_name -> openshell.sandbox.v1.EffectiveSetting
+	36, // [36:36] is the sub-list for method output_type
+	36, // [36:36] is the sub-list for method input_type
+	36, // [36:36] is the sub-list for extension type_name
+	36, // [36:36] is the sub-list for extension extendee
+	0,  // [0:36] is the sub-list for field type_name
 }
 
 func init() { file_sandbox_proto_init() }

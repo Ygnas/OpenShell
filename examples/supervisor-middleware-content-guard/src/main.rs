@@ -230,13 +230,13 @@ impl SupervisorMiddleware for ContentGuard {
                     operation: SupervisorMiddlewareOperation::HttpRequest as i32,
                     phase: PHASE as i32,
                     max_payload_bytes: MAX_PAYLOAD_BYTES,
-                    timeout: String::new(),
+                    request_timeout: None,
                 },
                 MiddlewareBinding {
                     operation: SupervisorMiddlewareOperation::WebsocketMessage as i32,
                     phase: PHASE as i32,
                     max_payload_bytes: MAX_PAYLOAD_BYTES,
-                    timeout: String::new(),
+                    request_timeout: None,
                 },
             ],
             expected_audience: String::new(),
@@ -478,7 +478,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openshell_core::proto::{WebSocketPreflight, WebSocketSessionEnd, WebSocketSessionStart};
+    use openshell_core::proto::{MiddlewareSessionEnd, WebSocketPreflight, WebSocketSessionStart};
     use prost_types::{ListValue, Value};
     use std::collections::BTreeMap;
 
@@ -550,7 +550,7 @@ mod tests {
                 )),
             })),
             event(web_socket_session_event::Event::SessionEnd(
-                WebSocketSessionEnd::default(),
+                MiddlewareSessionEnd::default(),
             )),
         ]);
         let mut results = ContentGuard::websocket_stream(events);

@@ -7,9 +7,7 @@
 
 mod helpers;
 
-use helpers::{
-    EnvVarGuard, build_ca, build_client_cert, build_server_cert, install_rustls_provider,
-};
+use helpers::{EnvVarGuard, build_ca, build_client_cert, build_server_cert};
 use openshell_cli::run;
 use openshell_cli::tls::TlsOptions;
 use openshell_core::proto::open_shell_server::{OpenShell, OpenShellServer};
@@ -61,17 +59,17 @@ impl TestOpenShell {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: format!("id-{name}"),
                     name: name.to_string(),
-                    created_at_ms: 0,
+                    created_time: None,
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: String::new(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 r#type: provider_type.to_string(),
                 credentials: HashMap::new(),
                 config: HashMap::new(),
-                credential_expires_at_ms: HashMap::new(),
+                credential_expiration_times: HashMap::new(),
                 profile_workspace: "default".to_string(),
                 credential_handles: HashMap::new(),
             },
@@ -81,6 +79,22 @@ impl TestOpenShell {
 
 #[tonic::async_trait]
 impl OpenShell for TestOpenShell {
+    async fn report_endpoint_status(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ReportEndpointStatusRequest>,
+    ) -> Result<Response<openshell_core::proto::ReportEndpointStatusResponse>, Status> {
+        Ok(Response::new(
+            openshell_core::proto::ReportEndpointStatusResponse {},
+        ))
+    }
+
+    async fn begin_rootfs_tar_staging(
+        &self,
+        _request: tonic::Request<openshell_core::proto::BeginRootfsTarStagingRequest>,
+    ) -> Result<Response<openshell_core::proto::BeginRootfsTarStagingResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
     async fn report_main_process_exit(
         &self,
         _request: tonic::Request<openshell_core::proto::ReportMainProcessExitRequest>,
@@ -154,6 +168,8 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(ListSandboxesResponse::default()))
     }
 
+    unimplemented_sandbox_template_rpcs!();
+
     async fn list_sandbox_providers(
         &self,
         _request: tonic::Request<ListSandboxProvidersRequest>,
@@ -179,7 +195,10 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<DeleteSandboxRequest>,
     ) -> Result<Response<DeleteSandboxResponse>, Status> {
-        Ok(Response::new(DeleteSandboxResponse { deleted: true }))
+        Ok(Response::new(DeleteSandboxResponse {
+            sandbox_id: String::new(),
+            outcome: openshell_core::proto::DeletionOutcome::Completed.into(),
+        }))
     }
 
     async fn get_sandbox_config(
@@ -307,21 +326,43 @@ impl OpenShell for TestOpenShell {
             .values()
             .cloned()
             .collect::<Vec<_>>();
-        Ok(Response::new(ListProvidersResponse { providers }))
+        Ok(Response::new(ListProvidersResponse {
+            providers,
+            next_page_token: String::new(),
+        }))
     }
 
     async fn list_provider_profiles(
         &self,
         _request: tonic::Request<openshell_core::proto::ListProviderProfilesRequest>,
     ) -> Result<Response<openshell_core::proto::ListProviderProfilesResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
+        let profiles = openshell_providers::builtin_profiles()
+            .iter()
+            .map(openshell_providers::ProviderTypeProfile::to_proto)
+            .collect();
+        Ok(Response::new(
+            openshell_core::proto::ListProviderProfilesResponse {
+                profiles,
+                next_page_token: String::new(),
+            },
+        ))
     }
 
     async fn get_provider_profile(
         &self,
-        _request: tonic::Request<openshell_core::proto::GetProviderProfileRequest>,
+        request: tonic::Request<openshell_core::proto::GetProviderProfileRequest>,
     ) -> Result<Response<openshell_core::proto::ProviderProfileResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
+        let id = request.into_inner().id;
+        let profile = openshell_providers::builtin_profiles()
+            .iter()
+            .find(|profile| profile.id == id)
+            .ok_or_else(|| Status::not_found("provider profile not found"))?
+            .to_proto();
+        Ok(Response::new(
+            openshell_core::proto::ProviderProfileResponse {
+                profile: Some(profile),
+            },
+        ))
     }
 
     async fn import_provider_profiles(
@@ -382,38 +423,34 @@ impl OpenShell for TestOpenShell {
             }
             base
         };
-        let merge_expiry = |mut base: HashMap<String, i64>, incoming: HashMap<String, i64>| {
-            if incoming.is_empty() {
-                return base;
-            }
-            for (k, v) in incoming {
-                if v <= 0 {
-                    base.remove(&k);
-                } else {
-                    base.insert(k, v);
+        let merge_expiry =
+            |mut base: HashMap<String, prost_types::Timestamp>,
+             incoming: HashMap<String, prost_types::Timestamp>| {
+                if incoming.is_empty() {
+                    return base;
                 }
-            }
-            base
-        };
+                base.extend(incoming);
+                base
+            };
         let existing_metadata = existing.metadata.clone().unwrap_or_default();
         let provider_metadata = provider.metadata.clone().unwrap_or_default();
         let updated = Provider {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: existing_metadata.id,
                 name: provider_metadata.name,
-                created_at_ms: existing_metadata.created_at_ms,
+                created_time: existing_metadata.created_time,
                 labels: existing_metadata.labels,
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: String::new(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             r#type: existing.r#type,
             credentials: merge(existing.credentials, provider.credentials),
             config: merge(existing.config, provider.config),
-            credential_expires_at_ms: merge_expiry(
-                existing.credential_expires_at_ms,
-                provider.credential_expires_at_ms,
+            credential_expiration_times: merge_expiry(
+                existing.credential_expiration_times,
+                provider.credential_expiration_times,
             ),
             profile_workspace: existing.profile_workspace,
             credential_handles: if provider.credential_handles.is_empty() {
@@ -462,7 +499,13 @@ impl OpenShell for TestOpenShell {
     ) -> Result<Response<DeleteProviderResponse>, Status> {
         let name = request.into_inner().name;
         let deleted = self.state.providers.lock().await.remove(&name).is_some();
-        Ok(Response::new(DeleteProviderResponse { deleted }))
+        Ok(Response::new(DeleteProviderResponse {
+            outcome: if deleted {
+                openshell_core::proto::DeletionOutcome::Completed.into()
+            } else {
+                openshell_core::proto::DeletionOutcome::AlreadyAbsent.into()
+            },
+        }))
     }
 
     type WatchSandboxStream =
@@ -708,8 +751,6 @@ struct TestServer {
 }
 
 async fn run_server() -> TestServer {
-    install_rustls_provider();
-
     let (ca, ca_key) = build_ca();
     let (server_cert, server_key) = build_server_cert(&ca, &ca_key);
     let (client_cert, client_key) = build_client_cert(&ca, &ca_key);
@@ -850,7 +891,7 @@ async fn explicit_provider_name_errors_for_unrecognised_name() {
         "error should mention the name: {msg}"
     );
     assert!(
-        msg.contains("not a recognized provider type"),
+        msg.contains("no provider profile"),
         "error should explain why it failed: {msg}"
     );
 }

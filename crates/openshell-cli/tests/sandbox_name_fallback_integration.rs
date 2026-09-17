@@ -3,9 +3,7 @@
 
 mod helpers;
 
-use helpers::{
-    EnvVarGuard, build_ca, build_client_cert, build_server_cert, install_rustls_provider,
-};
+use helpers::{EnvVarGuard, build_ca, build_client_cert, build_server_cert};
 use openshell_bootstrap::{load_last_sandbox, save_last_sandbox};
 use openshell_cli::run;
 use openshell_cli::tls::TlsOptions;
@@ -49,6 +47,22 @@ struct TestOpenShell {
 
 #[tonic::async_trait]
 impl OpenShell for TestOpenShell {
+    async fn report_endpoint_status(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ReportEndpointStatusRequest>,
+    ) -> Result<Response<openshell_core::proto::ReportEndpointStatusResponse>, Status> {
+        Ok(Response::new(
+            openshell_core::proto::ReportEndpointStatusResponse {},
+        ))
+    }
+
+    async fn begin_rootfs_tar_staging(
+        &self,
+        _request: tonic::Request<openshell_core::proto::BeginRootfsTarStagingRequest>,
+    ) -> Result<Response<openshell_core::proto::BeginRootfsTarStagingResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
     async fn report_main_process_exit(
         &self,
         _request: tonic::Request<openshell_core::proto::ReportMainProcessExitRequest>,
@@ -119,12 +133,12 @@ impl OpenShell for TestOpenShell {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: "test-id".to_string(),
                     name,
-                    created_at_ms: 0,
+                    created_time: None,
                     labels: std::collections::HashMap::new(),
                     resource_version: 0,
                     annotations: std::collections::HashMap::new(),
                     workspace: String::new(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 ..Default::default()
             }),
@@ -137,6 +151,8 @@ impl OpenShell for TestOpenShell {
     ) -> Result<Response<ListSandboxesResponse>, Status> {
         Ok(Response::new(ListSandboxesResponse::default()))
     }
+
+    unimplemented_sandbox_template_rpcs!();
 
     async fn list_sandbox_providers(
         &self,
@@ -163,7 +179,10 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<DeleteSandboxRequest>,
     ) -> Result<Response<DeleteSandboxResponse>, Status> {
-        Ok(Response::new(DeleteSandboxResponse { deleted: true }))
+        Ok(Response::new(DeleteSandboxResponse {
+            sandbox_id: String::new(),
+            outcome: openshell_core::proto::DeletionOutcome::Completed.into(),
+        }))
     }
 
     async fn get_sandbox_config(
@@ -177,7 +196,7 @@ impl OpenShell for TestOpenShell {
         );
         Ok(Response::new(GetSandboxConfigResponse {
             policy: Some(SandboxPolicy {
-                version: 9,
+                version: 1,
                 network_policies: [
                     (
                         "user_api".to_string(),
@@ -392,7 +411,9 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<DeleteProviderRequest>,
     ) -> Result<Response<DeleteProviderResponse>, Status> {
-        Ok(Response::new(DeleteProviderResponse { deleted: true }))
+        Ok(Response::new(DeleteProviderResponse {
+            outcome: openshell_core::proto::DeletionOutcome::Completed.into(),
+        }))
     }
 
     type WatchSandboxStream =
@@ -448,7 +469,7 @@ impl OpenShell for TestOpenShell {
         assert!(!req.global);
 
         let policy = SandboxPolicy {
-            version: 7,
+            version: 1,
             network_policies: std::iter::once((
                 "api".to_string(),
                 NetworkPolicyRule {
@@ -473,8 +494,8 @@ impl OpenShell for TestOpenShell {
                 version: 7,
                 policy_hash: "sha256:test-policy".to_string(),
                 status: PolicyStatus::Loaded.into(),
-                created_at_ms: 1_700_000_000_000,
-                loaded_at_ms: 1_700_000_000_500,
+                created_time: openshell_core::time::timestamp_from_millis(1_700_000_000_000).ok(),
+                loaded_time: openshell_core::time::timestamp_from_millis(1_700_000_000_500).ok(),
                 policy: Some(policy),
                 ..Default::default()
             }),
@@ -673,8 +694,6 @@ struct TestServer {
 }
 
 async fn run_server() -> TestServer {
-    install_rustls_provider();
-
     let (ca, ca_key) = build_ca();
     let (server_cert, server_key) = build_server_cert(&ca, &ca_key);
     let (client_cert, client_key) = build_client_cert(&ca, &ca_key);

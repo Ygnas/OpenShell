@@ -34,8 +34,10 @@ spec:
         - host.docker.internal
         - host.openshell.internal
   {{- end }}
+  {{- with .Values.podSecurityContext }}
   securityContext:
-    {{- toYaml .Values.podSecurityContext | nindent 4 }}
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
   containers:
     - name: openshell-gateway
       securityContext:
@@ -87,8 +89,12 @@ spec:
         - name: openshell-data
           mountPath: /var/openshell
         {{- end }}
+        # ConfigMap directory mounts expose keys through atomic-writer symlinks,
+        # while the gateway intentionally rejects symlinked configuration.
+        # The checksum annotation above rolls pods when this subPath changes.
         - name: gateway-config
-          mountPath: /etc/openshell
+          mountPath: /etc/openshell/gateway.toml
+          subPath: gateway.toml
           readOnly: true
         - name: sandbox-jwt
           mountPath: /etc/openshell-jwt
@@ -102,7 +108,7 @@ spec:
           mountPath: /etc/openshell-tls/server-external
           readOnly: true
         {{- end }}
-        {{- if or .Values.server.tls.clientCaSecretName (and .Values.pkiInitJob.enabled (not .Values.certManager.enabled)) (and .Values.certManager.enabled .Values.certManager.clientCaFromServerTlsSecret) }}
+        {{- if eq (include "openshell.gatewayClientCaEnabled" .) "true" }}
         - name: tls-client-ca
           mountPath: /etc/openshell-tls/client-ca
           readOnly: true
@@ -111,6 +117,11 @@ spec:
         {{- if and .Values.server.oidc.issuer .Values.server.oidc.caConfigMapName }}
         - name: oidc-ca
           mountPath: /etc/openshell-tls/oidc-ca
+          readOnly: true
+        {{- end }}
+        {{- if and .Values.server.credentialDrivers.vault.enabled .Values.server.credentialDrivers.vault.caConfigMapName }}
+        - name: vault-ca
+          mountPath: /etc/openshell-tls/vault-ca
           readOnly: true
         {{- end }}
         {{- if .Values.server.providerTokenGrants.spiffe.enabled }}
@@ -172,7 +183,7 @@ spec:
       secret:
         secretName: {{ include "openshell.fullname" . }}-server-external-tls
     {{- end }}
-    {{- if or .Values.server.tls.clientCaSecretName (and .Values.pkiInitJob.enabled (not .Values.certManager.enabled)) (and .Values.certManager.enabled .Values.certManager.clientCaFromServerTlsSecret) }}
+    {{- if eq (include "openshell.gatewayClientCaEnabled" .) "true" }}
     - name: tls-client-ca
       secret:
         {{- if or (and .Values.pkiInitJob.enabled (not .Values.certManager.enabled)) (and .Values.certManager.enabled .Values.certManager.clientCaFromServerTlsSecret) }}
@@ -189,6 +200,14 @@ spec:
     - name: oidc-ca
       configMap:
         name: {{ .Values.server.oidc.caConfigMapName }}
+    {{- end }}
+    {{- if and .Values.server.credentialDrivers.vault.enabled .Values.server.credentialDrivers.vault.caConfigMapName }}
+    - name: vault-ca
+      configMap:
+        name: {{ .Values.server.credentialDrivers.vault.caConfigMapName }}
+        items:
+          - key: ca.crt
+            path: ca.crt
     {{- end }}
     {{- if .Values.server.providerTokenGrants.spiffe.enabled }}
     - name: spiffe-workload-api

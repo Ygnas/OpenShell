@@ -9,6 +9,7 @@
 description = "Install TypeScript SDK dependencies"
 dir = "sdk/typescript"
 run = "npm ci"
+run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File ../../tasks/scripts/typescript-install.ps1"
 hide = true
 
 ["sdk:ts:proto"]
@@ -16,6 +17,7 @@ description = "Generate TypeScript protobuf stubs for the SDK"
 depends = ["sdk:ts:install"]
 dir = "sdk/typescript"
 run = "npm run gen"
+run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File ../../tasks/scripts/typescript-proto.ps1"
 
 # Lints the repo-level proto module (buf.yaml at the root) against STANDARD.
 # buf ships only in the SDK's devDependencies today, so this depends on the
@@ -25,6 +27,7 @@ run = "npm run gen"
 description = "Lint proto/ with buf (repo-level buf.yaml)"
 depends = ["sdk:ts:install"]
 run = "./sdk/typescript/node_modules/.bin/buf lint"
+run_windows = "sdk\\typescript\\node_modules\\.bin\\buf.cmd lint"
 
 ["sdk:ts:typecheck"]
 description = "Type-check the TypeScript SDK"
@@ -65,6 +68,46 @@ depends = [
   "sdk:ts:test",
   "sdk:ts:build",
 ]
+hide = true
+
+["sdk:ts:proto:drift"]
+description = "Check TypeScript SDK proto drift and output a JSON report"
+dir = "sdk/typescript"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+
+# TS SDK generated files (src/gen/) are gitignored, so there's no committed
+# baseline to diff against. Instead, detect drift by regenerating + type
+# checking: if the handwritten SDK code no longer compiles against the current
+# proto definitions, that's drift.
+
+if ! command -v jq &>/dev/null; then
+  echo '{"sdk":"typescript","synced":false,"error":"jq not found"}'
+  exit 1
+fi
+
+LOG_FILE=$(mktemp)
+trap 'rm -f "$LOG_FILE"' EXIT
+
+if ! mise run sdk:ts:proto > "$LOG_FILE" 2>&1; then
+  jq -n -c '{sdk:"typescript", synced:false, files:[], summary:"proto generation failed", error:"proto generation failed"}'
+  exit 1
+fi
+
+if ! mise run sdk:ts:typecheck >> "$LOG_FILE" 2>&1; then
+  jq -n -c '{sdk:"typescript", synced:false, files:[], summary:"typecheck failed after proto regeneration", error:"typecheck failed after proto regeneration"}'
+  exit 1
+fi
+
+jq -n -c '{sdk:"typescript", synced:true, files:[], summary:"all files synced"}'
+"""
+hide = true
+
+["sdk:ts:proto:build-check"]
+description = "Run full TypeScript SDK proto generate, typecheck, and test pipeline"
+dir = "sdk/typescript"
+run = 'bash ../../tasks/scripts/sdk_build_check.sh typescript gen=sdk:ts:proto typecheck=sdk:ts:typecheck test=sdk:ts:test'
 hide = true
 
 # Publish to the registry in package.json publishConfig. Set OPENSHELL_NPM_VERSION

@@ -7,17 +7,13 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use tracing::info;
-use tracing_subscriber::EnvFilter;
-use tracing_subscriber::prelude::*;
 
 use openshell_core::VERSION;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
-use openshell_driver_kubernetes::otel_tracing::compute_driver_rpc_layer;
 use openshell_driver_kubernetes::{
-    AppArmorProfile, ComputeDriverService, DEFAULT_GATEWAY_ID, DEFAULT_PROXY_UID,
-    DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME, KubernetesComputeConfig, KubernetesComputeDriver,
-    KubernetesSidecarConfig, ManagedSshIngressConfig, SupervisorSideloadMethod, SupervisorTopology,
-    WorkspaceMode,
+    ComputeDriverService, DEFAULT_GATEWAY_ID, DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME,
+    KubernetesComputeConfig, KubernetesComputeDriver, KubernetesImagePullPolicy,
+    KubernetesSandboxRuntimeConfig, ManagedSshIngressConfig, WorkspaceMode,
 };
 
 #[derive(Parser, Debug)]
@@ -75,7 +71,7 @@ struct Args {
     sandbox_image: Option<String>,
 
     #[arg(long, env = "OPENSHELL_SANDBOX_IMAGE_PULL_POLICY")]
-    sandbox_image_pull_policy: Option<String>,
+    sandbox_image_pull_policy: Option<KubernetesImagePullPolicy>,
 
     #[arg(
         long,
@@ -113,37 +109,31 @@ struct Args {
     #[arg(long, env = "OPENSHELL_HOST_GATEWAY_IP")]
     host_gateway_ip: Option<String>,
 
+    #[arg(long, env = "OPENSHELL_SANDBOX_RUNTIME_IMAGE")]
+    sandbox_runtime_image: Option<String>,
+
+    #[arg(long, env = "OPENSHELL_SANDBOX_RUNTIME_IMAGE_PULL_POLICY")]
+    sandbox_runtime_image_pull_policy: Option<KubernetesImagePullPolicy>,
+
     #[arg(long, env = "OPENSHELL_SUPERVISOR_IMAGE")]
     supervisor_image: Option<String>,
 
     #[arg(long, env = "OPENSHELL_SUPERVISOR_IMAGE_PULL_POLICY")]
-    supervisor_image_pull_policy: Option<String>,
+    supervisor_image_pull_policy: Option<KubernetesImagePullPolicy>,
 
     #[arg(
         long,
-        env = "OPENSHELL_SUPERVISOR_SIDELOAD_METHOD",
-        default_value = "image-volume"
+        env = "OPENSHELL_K8S_SANDBOX_RUNTIME_NETWORK_POLICY_ENFORCED",
+        default_value_t = false
     )]
-    supervisor_sideload_method: SupervisorSideloadMethod,
-
-    #[arg(long, env = "OPENSHELL_K8S_TOPOLOGY", default_value = "combined")]
-    topology: SupervisorTopology,
+    sandbox_runtime_network_policy_enforced: bool,
 
     #[arg(
-        long = "sidecar-proxy-uid",
-        alias = "proxy-uid",
-        env = "OPENSHELL_K8S_SIDECAR_PROXY_UID",
-        default_value_t = DEFAULT_PROXY_UID
+        long,
+        env = "OPENSHELL_K8S_SANDBOX_RUNTIME_BOUNDARY_PORT",
+        default_value_t = 5500
     )]
-    sidecar_proxy_uid: u32,
-
-    #[arg(
-        long = "sidecar-process-binary-aware-network-policy",
-        env = "OPENSHELL_K8S_SIDECAR_PROCESS_BINARY_AWARE_NETWORK_POLICY",
-        default_value_t = true,
-        action = ArgAction::Set
-    )]
-    sidecar_process_binary_aware_network_policy: bool,
+    sandbox_runtime_boundary_port: u16,
 
     /// Corporate HTTP forward proxy for policy-approved TLS CONNECT egress.
     #[arg(long, env = "OPENSHELL_UPSTREAM_PROXY")]
@@ -171,9 +161,6 @@ struct Args {
 
     #[arg(long, env = "OPENSHELL_ENABLE_USER_NAMESPACES")]
     enable_user_namespaces: bool,
-
-    #[arg(long, env = "OPENSHELL_K8S_APP_ARMOR_PROFILE")]
-    app_armor_profile: Option<AppArmorProfile>,
 
     /// Lifetime (seconds) of the projected `ServiceAccount` token
     /// kubelet writes into each sandbox pod for the `IssueSandboxToken`
@@ -218,24 +205,15 @@ async fn shutdown_signal() {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let (tracer_provider, setup_error) = openshell_driver_kubernetes::otel_tracing::provider_for(
-        args.otlp_endpoint.as_deref(),
-        args.gateway_name.as_deref(),
+    let _tracing = openshell_otel::install_driver_tracing(
+        openshell_driver_kubernetes::otel_tracing::TRACING,
+        openshell_otel::DriverTracingConfig {
+            endpoint: args.otlp_endpoint.as_deref(),
+            gateway_name: args.gateway_name.as_deref(),
+            service_version: VERSION,
+            log_level: &args.log_level,
+        },
     );
-    tracing_subscriber::registry()
-        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&args.log_level)))
-        .with(tracing_subscriber::fmt::layer())
-        .with(
-            tracer_provider
-                .as_ref()
-                .map(openshell_driver_kubernetes::otel_tracing::layer),
-        )
-        .init();
-    if let Some(error) = setup_error {
-        tracing::error!(%error, "OTLP exporting could not be started");
-    } else if let Some(endpoint) = &args.otlp_endpoint {
-        info!(endpoint, "OTLP exporting enabled");
-    }
 
     let managed_ssh_gateway_pod_selector = args
         .managed_ssh_gateway_pod_selector
@@ -260,23 +238,24 @@ async fn main() -> Result<()> {
             operator_namespace_file: args.operator_namespace_file,
             service_account_name: args.sandbox_service_account,
             default_image: args.sandbox_image.unwrap_or_default(),
-            image_pull_policy: args.sandbox_image_pull_policy.unwrap_or_default(),
+            image_pull_policy: args.sandbox_image_pull_policy,
             image_pull_secrets: args.sandbox_image_pull_secrets,
             managed_ssh_ingress: ManagedSshIngressConfig {
                 enabled: args.managed_ssh_ingress_enabled,
                 gateway_namespace: args.managed_ssh_gateway_namespace.unwrap_or_default(),
                 gateway_pod_selector: managed_ssh_gateway_pod_selector,
             },
+            sandbox_runtime_image: args
+                .sandbox_runtime_image
+                .unwrap_or_else(openshell_core::config::default_sandbox_runtime_image),
+            sandbox_runtime_image_pull_policy: args.sandbox_runtime_image_pull_policy,
             supervisor_image: args
                 .supervisor_image
                 .unwrap_or_else(openshell_core::config::default_supervisor_image),
-            supervisor_image_pull_policy: args.supervisor_image_pull_policy.unwrap_or_default(),
-            supervisor_sideload_method: args.supervisor_sideload_method,
-            topology: args.topology,
-            sidecar: KubernetesSidecarConfig {
-                proxy_uid: args.sidecar_proxy_uid,
-                process_binary_aware_network_policy: args
-                    .sidecar_process_binary_aware_network_policy,
+            supervisor_image_pull_policy: args.supervisor_image_pull_policy,
+            sandbox_runtime: KubernetesSandboxRuntimeConfig {
+                network_policy_enforced: args.sandbox_runtime_network_policy_enforced,
+                boundary_port: args.sandbox_runtime_boundary_port,
             },
             https_proxy: args.https_proxy,
             no_proxy: args.no_proxy,
@@ -289,7 +268,6 @@ async fn main() -> Result<()> {
             client_tls_secret_name: args.client_tls_secret_name.unwrap_or_default(),
             host_gateway_ip: args.host_gateway_ip.unwrap_or_default(),
             enable_user_namespaces: args.enable_user_namespaces,
-            app_armor_profile: args.app_armor_profile,
             workspace_default_storage_size: std::env::var(
                 "OPENSHELL_K8S_WORKSPACE_DEFAULT_STORAGE_SIZE",
             )
@@ -317,14 +295,14 @@ async fn main() -> Result<()> {
         shutdown_signal().await;
         let _ = shutdown_tx.send(true);
     };
-    let result = if let Some(socket_path) = args.bind_socket {
+    if let Some(socket_path) = args.bind_socket {
         let listener = openshell_core::external_driver_socket::bind_private(&socket_path)
             .map_err(|err| miette::miette!("{err}"))?;
         let _cleanup =
             openshell_core::external_driver_socket::SocketCleanup::new(socket_path.clone());
         info!(socket = %socket_path.display(), "Starting Kubernetes compute driver");
         tonic::transport::Server::builder()
-            .layer(compute_driver_rpc_layer())
+            .layer(openshell_otel::compute_driver_rpc_layer())
             .add_service(service)
             .serve_with_incoming_shutdown(
                 openshell_core::external_driver_socket::SameUidUnixIncoming::new(listener),
@@ -335,18 +313,12 @@ async fn main() -> Result<()> {
     } else {
         info!(address = %args.bind_address, "Starting Kubernetes compute driver");
         tonic::transport::Server::builder()
-            .layer(compute_driver_rpc_layer())
+            .layer(openshell_otel::compute_driver_rpc_layer())
             .add_service(service)
             .serve_with_shutdown(args.bind_address, shutdown)
             .await
             .into_diagnostic()
-    };
-    if let Some(provider) = &tracer_provider
-        && let Err(error) = provider.shutdown()
-    {
-        tracing::warn!(%error, "OTLP tracer provider shutdown failed");
     }
-    result
 }
 
 #[cfg(test)]

@@ -325,7 +325,7 @@ generate_gateway_jwt_bundle() {
 write_gateway_config() {
   cat >"$GATEWAY_CONFIG" <<EOF
 [openshell]
-version = 1
+version = 2
 
 [openshell.gateway]
 provider_profile_sources = [
@@ -340,7 +340,6 @@ signing_key_path = "$JWT_DIR/signing.pem"
 public_key_path = "$JWT_DIR/public.pem"
 kid_path = "$JWT_DIR/kid"
 gateway_id = "$RUN_ID"
-ttl_secs = 0
 
 [[openshell.gateway.interceptors]]
 name = "provider-governance"
@@ -395,7 +394,7 @@ start_interceptor() {
 
 start_gateway() {
   printf 'INFO starting gateway\n'
-  env -u OPENSHELL_DRIVERS "$ROOT/target/debug/openshell-gateway" \
+  env -u OPENSHELL_COMPUTE_DRIVER "$ROOT/target/debug/openshell-gateway" \
     --config "$GATEWAY_CONFIG" \
     --bind-address 127.0.0.1 \
     --port "$GATEWAY_PORT" \
@@ -434,7 +433,6 @@ configure_gateway() {
     --gateway-endpoint "$GATEWAY_ENDPOINT"
   )
 
-  run_setup_step "enabling provider profile policy composition" "${CLI[@]}" settings set --global --key providers_v2_enabled --value true --yes
   wait_for_profile "github"
   wait_for_profile "slack"
 }
@@ -650,7 +648,7 @@ wait_until_stopped() {
 
 cd "$ROOT"
 
-run_setup_step "building gateway" cargo build --quiet -p openshell-server --bin openshell-gateway
+run_setup_step "building gateway" cargo build --quiet -p openshell-gateway --bin openshell-gateway
 run_setup_step "building governance interceptor" cargo build --quiet --manifest-path "$EXAMPLE_DIR/Cargo.toml"
 run_setup_step "building CLI" cargo build --quiet -p openshell-cli --bin openshell
 

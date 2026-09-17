@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{ObjectType, PersistenceError, Store, generate_name, test_store};
+use super::{ObjectListQuery, ObjectType, PersistenceError, Store, generate_name, test_store};
 use crate::policy_store::{AtomicPolicyRevisionWrite, PolicyStoreExt};
 use openshell_core::proto::datamodel::v1::ObjectMeta as ProtoObjectMeta;
 use openshell_core::proto::{ObjectForTest, Sandbox, SandboxPolicy, SandboxSpec};
@@ -125,11 +125,155 @@ async fn sqlite_put_get_round_trip() {
 }
 
 #[tokio::test]
+async fn collect_records_exhausts_multiple_keyset_pages_exactly_once() {
+    let store = test_store().await;
+    let expected = 1005_usize;
+    for index in 0..expected {
+        let id = format!("collect-{index:04}");
+        let name = format!("sandbox-{index:04}");
+        store
+            .put("sandbox", &id, &name, "collect-test", b"payload", None)
+            .await
+            .unwrap();
+    }
+
+    let records = store
+        .collect_records("sandbox", ObjectListQuery::Workspace("collect-test"))
+        .await
+        .unwrap();
+    let ids = records
+        .iter()
+        .map(|record| record.id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+
+    assert_eq!(records.len(), expected);
+    assert_eq!(ids.len(), expected, "every record is visited exactly once");
+}
+
+#[tokio::test]
 async fn sqlite_connect_runs_embedded_migrations() {
     let store = test_store().await;
 
     let records = store.list("sandbox", "default", 10, 0).await.unwrap();
     assert!(records.is_empty());
+}
+
+#[tokio::test]
+async fn sqlite_inference_route_removal_migration_deletes_only_managed_routes() {
+    use sqlx::{Connection, SqliteConnection};
+
+    let migration = super::sqlite::embedded_migration_sql(7)
+        .expect("SQLite migrator must embed removal migration 007");
+    let mut connection = SqliteConnection::connect("sqlite::memory:")
+        .await
+        .expect("connect to migration test database");
+    sqlx::raw_sql(
+        "CREATE TABLE objects (object_type TEXT NOT NULL, id TEXT NOT NULL);\
+         INSERT INTO objects VALUES ('inference_route', 'managed-route');\
+         INSERT INTO objects VALUES ('sandbox', 'preserved-sandbox');",
+    )
+    .execute(&mut connection)
+    .await
+    .expect("seed pre-migration objects");
+
+    sqlx::raw_sql(migration)
+        .execute(&mut connection)
+        .await
+        .expect("run SQLite removal migration");
+
+    let remaining: Vec<(String, String)> =
+        sqlx::query_as("SELECT object_type, id FROM objects ORDER BY object_type, id")
+            .fetch_all(&mut connection)
+            .await
+            .expect("read migrated objects");
+    assert_eq!(
+        remaining,
+        vec![("sandbox".to_string(), "preserved-sandbox".to_string())],
+        "removal migration must purge managed routes without touching other objects"
+    );
+}
+
+#[test]
+fn embedded_migrators_include_inference_route_removal() {
+    for (backend, migration) in [
+        ("sqlite", super::sqlite::embedded_migration_sql(7)),
+        ("postgres", super::postgres::embedded_migration_sql(7)),
+    ] {
+        let sql =
+            migration.unwrap_or_else(|| panic!("{backend} migrator is missing migration 007"));
+        assert!(
+            sql.contains("DELETE FROM objects WHERE object_type = 'inference_route'"),
+            "{backend} migration 007 must purge managed inference route objects"
+        );
+    }
+}
+
+#[test]
+fn embedded_migrators_include_pagination_indexes() {
+    for (backend, migration) in [
+        ("sqlite", super::sqlite::embedded_migration_sql(8)),
+        ("postgres", super::postgres::embedded_migration_sql(8)),
+    ] {
+        let sql =
+            migration.unwrap_or_else(|| panic!("{backend} migrator is missing migration 008"));
+        assert!(
+            sql.contains("objects_workspace_page_idx")
+                && sql.contains("objects_all_workspaces_page_idx"),
+            "{backend} migration 008 must add both keyset pagination indexes"
+        );
+    }
+}
+
+#[tokio::test]
+async fn sqlite_in_memory_store_survives_pool_connection_replacement() {
+    for url in ["sqlite::memory:", "sqlite://?mode=memory"] {
+        let store = super::sqlite::SqliteStore::connect(url)
+            .await
+            .expect("connect to in-memory SQLite");
+        store.migrate().await.expect("migrate in-memory SQLite");
+        store
+            .put(
+                "sandbox",
+                "before-replacement",
+                "before-replacement",
+                "default",
+                b"before",
+                None,
+            )
+            .await
+            .expect("write before connection replacement");
+
+        super::sqlite::replace_pool_connection(&store)
+            .await
+            .expect("replace operational pool connection");
+
+        let preserved = store
+            .get("sandbox", "before-replacement")
+            .await
+            .expect("schema survives connection replacement")
+            .expect("existing object survives connection replacement");
+        assert_eq!(preserved.payload, b"before", "database URL: {url}");
+
+        store
+            .put(
+                "sandbox",
+                "after-replacement",
+                "after-replacement",
+                "default",
+                b"after",
+                None,
+            )
+            .await
+            .expect("write after connection replacement");
+        assert!(
+            store
+                .get("sandbox", "after-replacement")
+                .await
+                .expect("read after connection replacement")
+                .is_some(),
+            "database URL: {url}"
+        );
+    }
 }
 
 #[cfg(unix)]
@@ -364,6 +508,116 @@ async fn sqlite_delete_behavior() {
 
     let deleted_again = store.delete("sandbox", "missing").await.unwrap();
     assert!(!deleted_again);
+}
+
+#[tokio::test]
+async fn delete_many_is_bounded_idempotent_and_type_scoped() {
+    let store = test_store().await;
+    let mut ids = Vec::new();
+    for idx in 0..(super::DELETE_MANY_BATCH_SIZE + 12) {
+        let id = format!("sandbox-{idx}");
+        store
+            .put(
+                "sandbox",
+                &id,
+                &format!("name-{idx}"),
+                "default",
+                b"payload",
+                None,
+            )
+            .await
+            .unwrap();
+        ids.push(id);
+    }
+    store
+        .put(
+            "provider",
+            "other-type",
+            "other-type",
+            "default",
+            b"payload",
+            None,
+        )
+        .await
+        .unwrap();
+
+    ids.extend([
+        "missing".to_string(),
+        "other-type".to_string(),
+        "sandbox-0".to_string(),
+    ]);
+    let expected = u64::try_from(super::DELETE_MANY_BATCH_SIZE + 12).unwrap();
+    assert_eq!(store.delete_many("sandbox", &ids).await.unwrap(), expected);
+    assert_eq!(store.delete_many("sandbox", &ids).await.unwrap(), 0);
+    assert_eq!(store.delete_many("sandbox", &[]).await.unwrap(), 0);
+    assert!(store.get("provider", "other-type").await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn file_backed_sqlite_bulk_delete_allows_concurrent_control_reads() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let url = format!("sqlite:{}?mode=rwc", tmp.path().join("bulk.db").display());
+    let store = Store::connect(&url)
+        .await
+        .expect("connect file-backed store");
+    store
+        .put(
+            "provider",
+            "control-row",
+            "control-row",
+            "default",
+            b"control",
+            None,
+        )
+        .await
+        .unwrap();
+
+    let mut ids = Vec::new();
+    for idx in 0..500 {
+        let id = format!("session-{idx}");
+        store
+            .put("ssh_session", &id, &id, "default", b"payload", None)
+            .await
+            .unwrap();
+        ids.push(id);
+    }
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let read_store = store.clone();
+    let read_stop = stop.clone();
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let reader = tokio::spawn(async move {
+        let mut reads = 0_usize;
+        let mut started_tx = Some(started_tx);
+        while !read_stop.load(Ordering::Relaxed) {
+            read_store
+                .get("provider", "control-row")
+                .await
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "control row disappeared".to_string())?;
+            reads += 1;
+            if let Some(started_tx) = started_tx.take() {
+                let _ = started_tx.send(());
+            }
+            tokio::task::yield_now().await;
+        }
+        Ok::<usize, String>(reads)
+    });
+    started_rx.await.expect("reader started");
+
+    assert_eq!(store.delete_many("ssh_session", &ids).await.unwrap(), 500);
+    stop.store(true, Ordering::Relaxed);
+    assert!(reader.await.unwrap().unwrap() > 0);
+    assert!(
+        store
+            .get("provider", "control-row")
+            .await
+            .unwrap()
+            .is_some()
+    );
 }
 
 #[tokio::test]
@@ -828,7 +1082,7 @@ fn policy_test_sandbox(id: &str, name: &str) -> Sandbox {
         metadata: Some(ProtoObjectMeta {
             id: id.to_string(),
             name: name.to_string(),
-            created_at_ms: 1,
+            created_time: openshell_core::time::timestamp_from_millis(1).ok(),
             workspace: "default".to_string(),
             ..Default::default()
         }),
@@ -1700,15 +1954,16 @@ async fn cas_update_message_cas_succeeds() {
         metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
             id: "test-id".to_string(),
             name: "test-sandbox".to_string(),
-            created_at_ms: 1000,
+            created_time: openshell_core::time::timestamp_from_millis(1000).ok(),
             labels: std::collections::HashMap::new(),
             resource_version: 0,
             annotations: std::collections::HashMap::new(),
             workspace: "default".to_string(),
-            deletion_timestamp_ms: 0,
+            deletion_time: None,
         }),
         spec: None,
         status: None,
+        ..Sandbox::default()
     };
 
     store.put_message(&sandbox).await.unwrap();
@@ -1742,15 +1997,16 @@ async fn cas_update_message_cas_conflicts_on_concurrent_updates() {
         metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
             id: "test-id".to_string(),
             name: "test-sandbox".to_string(),
-            created_at_ms: 1000,
+            created_time: openshell_core::time::timestamp_from_millis(1000).ok(),
             labels: std::collections::HashMap::new(),
             resource_version: 0,
             annotations: std::collections::HashMap::new(),
             workspace: "default".to_string(),
-            deletion_timestamp_ms: 0,
+            deletion_time: None,
         }),
         spec: None,
         status: None,
+        ..Sandbox::default()
     };
 
     store.put_message(&sandbox).await.unwrap();
@@ -1812,15 +2068,16 @@ async fn cas_update_message_cas_rejects_workspace_change() {
         metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
             id: "ws-immutable".to_string(),
             name: "test-sandbox".to_string(),
-            created_at_ms: 1000,
+            created_time: openshell_core::time::timestamp_from_millis(1000).ok(),
             labels: std::collections::HashMap::new(),
             annotations: std::collections::HashMap::new(),
             resource_version: 0,
             workspace: "alpha".to_string(),
-            deletion_timestamp_ms: 0,
+            deletion_time: None,
         }),
         spec: None,
         status: None,
+        ..Sandbox::default()
     };
 
     store.put_message(&sandbox).await.unwrap();
@@ -1854,15 +2111,16 @@ async fn cas_update_message_cas_rejects_name_change() {
         metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
             id: "name-immutable".to_string(),
             name: "original".to_string(),
-            created_at_ms: 1000,
+            created_time: openshell_core::time::timestamp_from_millis(1000).ok(),
             labels: std::collections::HashMap::new(),
             annotations: std::collections::HashMap::new(),
             resource_version: 0,
             workspace: "default".to_string(),
-            deletion_timestamp_ms: 0,
+            deletion_time: None,
         }),
         spec: None,
         status: None,
+        ..Sandbox::default()
     };
 
     store.put_message(&sandbox).await.unwrap();

@@ -7,7 +7,10 @@ use openshell_core::proto::{
     L7Allow, L7DenyRule, L7Rule, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, SandboxPolicy,
 };
 
-use crate::is_provider_rule_name;
+use crate::{
+    PolicyViolation, canonicalize_mcp_options, is_provider_rule_name, restrictive_default_policy,
+    validate_and_canonicalize_sandbox_policy,
+};
 
 const DEFAULT_JSON_RPC_MAX_BODY_BYTES: u32 = 64 * 1024;
 
@@ -17,8 +20,11 @@ const DEFAULT_JSON_RPC_MAX_BODY_BYTES: u32 = 64 * 1024;
 /// has one unambiguous endpoint contract, proposing a second generic L4
 /// endpoint loses inspection metadata and can make the effective policy
 /// ambiguous. Preserve the existing contract instead. Sandbox-owned rules are
-/// expanded in place; provider-owned rules remain immutable and are mirrored
-/// into the requested sandbox-owned overlay.
+/// expanded in place only when they already authorize the observed binaries.
+/// A new advisor-observed binary stays in a separate endpoint-provenance-marked
+/// rule so it cannot inherit exact-host private-address trust. Provider-owned
+/// rules remain immutable and are mirrored into the requested sandbox-owned
+/// overlay.
 pub fn canonicalize_advisor_add_rule(
     base_policy: &SandboxPolicy,
     effective_policy: &SandboxPolicy,
@@ -45,9 +51,11 @@ pub fn canonicalize_advisor_add_rule(
         })
         .cloned()
         .map(|mut endpoint| {
-            // This marker is derived from provider/credential context by the
-            // gateway and must never be persisted from an advisor proposal.
+            // Provenance does not change the endpoint contract. The gateway
+            // derives the credential marker, and the advisor marker records
+            // where a persisted endpoint came from.
             endpoint.provider_credentialed = false;
+            endpoint.advisor_proposed = false;
             // A denial observes one binary-to-port authorization. Preserve the
             // existing inspection contract, but never copy sibling ports from
             // a multi-port endpoint into the proposal.
@@ -79,23 +87,52 @@ pub fn canonicalize_advisor_add_rule(
         .iter()
         .filter(|(name, _)| !is_provider_rule_name(name))
         .filter_map(|(name, rule)| {
-            rule.endpoints
+            (rule.endpoints.iter().any(|endpoint| {
+                let mut normalized = endpoint.clone();
+                normalized.provider_credentialed = false;
+                normalized.advisor_proposed = false;
+                normalize_endpoint(&mut normalized);
+                normalized == contract
+            }) && incoming_rule
+                .binaries
                 .iter()
-                .any(|endpoint| {
-                    let mut normalized = endpoint.clone();
-                    normalized.provider_credentialed = false;
-                    normalize_endpoint(&mut normalized);
-                    normalized == contract
-                })
-                .then_some(name.clone())
+                .all(|binary| binary_scope_covers(rule, binary)))
+            .then_some(name.clone())
         })
         .collect::<Vec<_>>();
     sandbox_owners.sort();
 
-    let target_name = sandbox_owners
-        .first()
-        .cloned()
-        .unwrap_or_else(|| requested_rule_name.to_string());
+    let mut contract = contract;
+    let target_name = if let Some(owner) = sandbox_owners.first() {
+        if let Some(endpoint) =
+            base_policy.network_policies[owner]
+                .endpoints
+                .iter()
+                .find(|endpoint| {
+                    let mut normalized = (*endpoint).clone();
+                    normalized.provider_credentialed = false;
+                    normalized.advisor_proposed = false;
+                    normalize_endpoint(&mut normalized);
+                    normalized == contract
+                })
+        {
+            contract.advisor_proposed = endpoint.advisor_proposed;
+        }
+        owner.clone()
+    } else {
+        // A provider-owned contract is mirrored into a new sandbox-owned
+        // advisor overlay, so retain the incoming proposal provenance.
+        contract.advisor_proposed = incoming_endpoint.advisor_proposed;
+        let mut candidate = requested_rule_name.to_string();
+        let mut suffix = 2_u32;
+        while base_policy.network_policies.contains_key(&candidate)
+            || effective_policy.network_policies.contains_key(&candidate)
+        {
+            candidate = format!("{requested_rule_name}_{suffix}");
+            suffix += 1;
+        }
+        candidate
+    };
     let mut canonical = incoming_rule.clone();
     canonical.name.clone_from(&target_name);
     canonical.endpoints = vec![contract];
@@ -265,6 +302,15 @@ pub const ANY_BINARY_SCOPE: &str = "any binary";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PolicyMergeError {
+    /// The current policy was invalid before any operation was considered.
+    InvalidInputPolicy {
+        violations: Vec<PolicyViolation>,
+    },
+    /// An `AddRule` operation carried an invalid raw policy fragment.
+    InvalidOperationPolicy {
+        operation_index: usize,
+        violations: Vec<PolicyViolation>,
+    },
     MissingRuleNameForAddRule,
     /// An `AddRule` operation has no endpoint authorization to merge.
     EmptyAddRuleEndpoints {
@@ -334,6 +380,10 @@ pub enum PolicyMergeError {
         rule_name: String,
         binary_path: String,
     },
+    /// Valid inputs produced an invalid output, indicating a merge invariant failure.
+    InvalidMergedPolicy {
+        violations: Vec<PolicyViolation>,
+    },
     InvalidEndpointReference {
         host: String,
         port: u32,
@@ -365,6 +415,17 @@ pub enum PolicyMergeError {
 impl std::fmt::Display for PolicyMergeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::InvalidInputPolicy { violations } => {
+                write_policy_violations(f, "current policy is invalid", violations)
+            }
+            Self::InvalidOperationPolicy {
+                operation_index,
+                violations,
+            } => write_policy_violations(
+                f,
+                &format!("merge operation {operation_index} carries an invalid policy rule"),
+                violations,
+            ),
             Self::MissingRuleNameForAddRule => write!(f, "add-rule operation requires a rule name"),
             Self::EmptyAddRuleEndpoints {
                 operation_index,
@@ -439,6 +500,9 @@ impl std::fmt::Display for PolicyMergeError {
                 f,
                 "merge operation {operation_index} cannot remove binary '{binary_path}' from rule '{rule_name}' because the rule authorizes any binary; replace the policy with an explicit binary list or remove the rule"
             ),
+            Self::InvalidMergedPolicy { violations } => {
+                write_policy_violations(f, "merge produced an invalid policy", violations)
+            }
             Self::InvalidEndpointReference { host, port } => {
                 write!(f, "invalid endpoint reference '{host}:{port}'")
             }
@@ -473,6 +537,18 @@ impl std::fmt::Display for PolicyMergeError {
 }
 
 impl std::error::Error for PolicyMergeError {}
+
+fn write_policy_violations(
+    formatter: &mut std::fmt::Formatter<'_>,
+    context: &str,
+    violations: &[PolicyViolation],
+) -> std::fmt::Result {
+    formatter.write_str(context)?;
+    for violation in violations {
+        write!(formatter, "; {violation}")?;
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PolicyMergeResult {
@@ -515,6 +591,16 @@ pub struct PolicyMergeResult {
 /// treats an unset proposal value as unspecified for fields the merge retains,
 /// and exact-matches only the fields the proposal actually set.
 pub fn policy_covers_rule(policy: &SandboxPolicy, proposed: &NetworkPolicyRule) -> bool {
+    // Coverage is used as an admission signal. Invalid loaded or proposed
+    // state must fail closed instead of being treated as semantic equality.
+    // Compare the checked canonical values so authored omissions such as the
+    // pinned MCP revision default resolve exactly as they do during merge.
+    let Ok(policy) = validate_and_canonicalize_sandbox_policy(policy.clone()) else {
+        return false;
+    };
+    let Ok(proposed) = validate_rule_fragment("coverage-proposal", proposed.clone()) else {
+        return false;
+    };
     if proposed.endpoints.is_empty() {
         return false;
     }
@@ -632,7 +718,8 @@ fn endpoint_attributes_cover(loaded: &NetworkEndpoint, proposed: &NetworkEndpoin
         return false;
     }
 
-    // Widened fields (list appends and `|=` flags) use containment: merging
+    // Widened fields (list appends and authorization flags) use containment:
+    // merging
     // into an endpoint that already carries them leaves the loaded copy a
     // superset of the proposal, so equality would report "not covered" for a
     // proposal that did land.
@@ -648,7 +735,6 @@ fn endpoint_attributes_cover(loaded: &NetworkEndpoint, proposed: &NetworkEndpoin
             loaded.request_body_credential_rewrite,
             proposed.request_body_credential_rewrite,
         )
-        && flag_covers(loaded.advisor_proposed, proposed.advisor_proposed)
         // Fields the merge neither widens nor retains: it drops them entirely.
         // An unset proposal value asks for nothing and is satisfied by whatever
         // is loaded; a set value that differs was dropped, so the proposal is
@@ -726,30 +812,29 @@ fn effective_enforcement(value: &str) -> &str {
     if value.is_empty() { "audit" } else { value }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct EffectiveMcpContract {
+    versions: Vec<String>,
     strict_tool_names: bool,
     allow_all_known_mcp_methods: bool,
     max_body_bytes: u32,
 }
 
 fn effective_mcp_contract(endpoint: &NetworkEndpoint) -> Option<EffectiveMcpContract> {
-    endpoint
-        .protocol
-        .eq_ignore_ascii_case("mcp")
-        .then(|| EffectiveMcpContract {
-            strict_tool_names: endpoint
-                .mcp
-                .as_ref()
-                .and_then(|options| options.strict_tool_names)
-                .unwrap_or(true),
-            allow_all_known_mcp_methods: endpoint
-                .mcp
-                .as_ref()
-                .and_then(|options| options.allow_all_known_mcp_methods)
-                .unwrap_or(false),
-            max_body_bytes: effective_json_rpc_max_body_bytes(endpoint.json_rpc_max_body_bytes),
-        })
+    if !endpoint.protocol.eq_ignore_ascii_case("mcp") {
+        return None;
+    }
+
+    // Public merge entry points validate MCP options before comparison. Keep
+    // this helper fail closed for internal coverage checks as well.
+    let mut options = endpoint.mcp.clone()?;
+    canonicalize_mcp_options(&mut options);
+    Some(EffectiveMcpContract {
+        versions: options.versions,
+        strict_tool_names: options.strict_tool_names.unwrap_or(true),
+        allow_all_known_mcp_methods: options.allow_all_known_mcp_methods.unwrap_or(false),
+        max_body_bytes: effective_json_rpc_max_body_bytes(endpoint.json_rpc_max_body_bytes),
+    })
 }
 
 fn effective_json_rpc_max_body_bytes(value: u32) -> u32 {
@@ -772,24 +857,41 @@ fn mcp_contracts_match(left: &NetworkEndpoint, right: &NetworkEndpoint) -> bool 
     }
 }
 
+/// Apply policy operations only after validating and canonicalizing every input.
+///
+/// The current policy is validated first. Each `AddRule` is then validated
+/// immediately before it is applied to a private clone, preserving request-order
+/// errors without exposing partial mutations. The final policy is validated
+/// again so an internal merge invariant failure cannot reach a caller.
 pub fn merge_policy(
     policy: SandboxPolicy,
     operations: &[PolicyMergeOp],
 ) -> Result<PolicyMergeResult, PolicyMergeError> {
-    let mut merged = policy.clone();
+    let canonical_input = validate_and_canonicalize_sandbox_policy(policy).map_err(|error| {
+        PolicyMergeError::InvalidInputPolicy {
+            violations: error.into_violations(),
+        }
+    })?;
+    let mut merged = canonical_input.clone();
     let mut warnings = Vec::new();
 
     // Validate and apply in request order. `merged` is private until every
     // operation succeeds, so failures remain atomic without allowing a later
     // malformed operation to replace the error from an earlier operation.
-    let conflicts_before = conflicting_inspection_contracts(&policy);
+    let conflicts_before = conflicting_inspection_contracts(&canonical_input);
     for (operation_index, operation) in operations.iter().enumerate() {
         validate_operation(operation_index, operation)?;
-        apply_operation(&mut merged, operation_index, operation, &mut warnings)?;
+        let operation = validate_and_canonicalize_operation(operation_index, operation)?;
+        apply_operation(&mut merged, operation_index, &operation, &mut warnings)?;
     }
     ensure_no_new_inspection_conflicts(&merged, &conflicts_before)?;
 
-    let changed = merged != policy;
+    let merged = validate_and_canonicalize_sandbox_policy(merged).map_err(|error| {
+        PolicyMergeError::InvalidMergedPolicy {
+            violations: error.into_violations(),
+        }
+    })?;
+    let changed = merged != canonical_input;
     Ok(PolicyMergeResult {
         policy: merged,
         warnings,
@@ -864,8 +966,8 @@ fn conflicting_inspection_contracts(
 /// a plain REST rule on an overlapping path can satisfy authorization for a tool
 /// call the MCP endpoint never allowed, and the relay forwards it. MCP therefore
 /// cannot share a host and port with a differently inspected endpoint. Two MCP
-/// endpoints must also agree on one contract, because MCP options are not
-/// path-selected.
+/// endpoints must also agree on one contract, including the exact revision
+/// allowlist, because MCP options are not path-selected.
 fn inspections_conflict(found: &[(EffectiveInspection, String)]) -> bool {
     let mut mcp_contracts = found
         .iter()
@@ -881,16 +983,20 @@ fn inspections_conflict(found: &[(EffectiveInspection, String)]) -> bool {
 
 /// Rejects an operation that introduces an L7 inspection-contract conflict.
 ///
-/// Only conflicts absent from `before` are rejected. A policy that already
-/// carries one, for instance through a provider profile composed outside this
-/// merge, would otherwise make every later update fail with an error the
-/// operation did nothing to cause.
+/// A policy that already carries a conflict, for instance through a provider
+/// profile composed outside this merge, must still permit unrelated updates and
+/// operations that reduce its existing contract set. A post-merge conflict is
+/// rejected when it contains any contract that was absent before, because that
+/// operation introduced a new inspection ambiguity at the host and port.
 fn ensure_no_new_inspection_conflicts(
     merged: &SandboxPolicy,
     before: &BTreeMap<(String, u32), Vec<String>>,
 ) -> Result<(), PolicyMergeError> {
     for ((host, port), contracts) in conflicting_inspection_contracts(merged) {
-        if before.contains_key(&(host.clone(), port)) {
+        let contains_only_preexisting_contracts = before
+            .get(&(host.clone(), port))
+            .is_some_and(|prior| contracts.iter().all(|contract| prior.contains(contract)));
+        if contains_only_preexisting_contracts {
             continue;
         }
         return Err(PolicyMergeError::ConflictingInspectionContracts {
@@ -900,6 +1006,45 @@ fn ensure_no_new_inspection_conflicts(
         });
     }
     Ok(())
+}
+
+fn validate_and_canonicalize_operation(
+    operation_index: usize,
+    operation: &PolicyMergeOp,
+) -> Result<PolicyMergeOp, PolicyMergeError> {
+    let PolicyMergeOp::AddRule { rule_name, rule } = operation else {
+        return Ok(operation.clone());
+    };
+
+    let rule = validate_rule_fragment(rule_name, rule.clone()).map_err(|violations| {
+        PolicyMergeError::InvalidOperationPolicy {
+            operation_index,
+            violations,
+        }
+    })?;
+    Ok(PolicyMergeOp::AddRule {
+        rule_name: rule_name.clone(),
+        rule,
+    })
+}
+
+fn validate_rule_fragment(
+    rule_name: &str,
+    rule: NetworkPolicyRule,
+) -> Result<NetworkPolicyRule, Vec<PolicyViolation>> {
+    let mut fragment = restrictive_default_policy();
+    fragment
+        .network_policies
+        .insert(rule_name.to_string(), rule);
+    let mut canonical = validate_and_canonicalize_sandbox_policy(fragment)
+        .map_err(crate::PolicyValidationError::into_violations)?;
+
+    // Canonicalization only mutates endpoint fields, so a validated fragment
+    // must retain the key inserted immediately above.
+    Ok(canonical
+        .network_policies
+        .remove(rule_name)
+        .expect("validated fragment must retain its rule"))
 }
 
 fn validate_operation(
@@ -1033,10 +1178,13 @@ fn add_rule(
         incoming_rule.name = rule_name.to_string();
     }
 
-    // Endpoint-overlap fallback: when a chunk arrives with a new rule_name
-    // that doesn't already exist, fold it into a same-host/port rule if one
-    // is present. This is intentional for user-authored policies (incremental
-    // refinements live under one rule name).
+    // Endpoint-overlap fallback: when an explicit chunk arrives with a new
+    // rule_name that doesn't already exist, fold it into a same-host/port rule
+    // if one is present. This is intentional for user-authored policies
+    // (incremental refinements live under one rule name). Advisor-proposed
+    // endpoints must stay on their requested key: folding one into an explicit
+    // endpoint would clear its provenance and let a newly observed binary
+    // inherit exact-host private-address trust.
     //
     // Provider-injected rules (`_provider_*` — see `compose.rs::provider_rule_name`)
     // are deliberately EXCLUDED from this fallback. Provider profiles supply a
@@ -1051,7 +1199,11 @@ fn add_rule(
     let requested_key_exists = policy.network_policies.contains_key(rule_name);
     let target_key = if requested_key_exists {
         Some(rule_name.to_string())
-    } else {
+    } else if incoming_rule
+        .endpoints
+        .iter()
+        .all(|endpoint| !endpoint.advisor_proposed)
+    {
         let mut keys: Vec<_> = policy.network_policies.keys().cloned().collect();
         keys.sort();
         keys.into_iter()
@@ -1064,6 +1216,8 @@ fn add_rule(
                         rules_share_endpoint(existing_rule, &incoming_rule)
                     })
             })
+    } else {
+        None
     };
 
     match target_key {
@@ -1189,7 +1343,10 @@ fn is_authorization_inheritance_conflict(error: &PolicyMergeError) -> bool {
 
         // Malformed operations, and operations `merge_rules` never produces.
         // Neither is answered by choosing a different rule to write to.
-        PolicyMergeError::MissingRuleNameForAddRule
+        PolicyMergeError::InvalidInputPolicy { .. }
+        | PolicyMergeError::InvalidOperationPolicy { .. }
+        | PolicyMergeError::InvalidMergedPolicy { .. }
+        | PolicyMergeError::MissingRuleNameForAddRule
         | PolicyMergeError::EmptyAddRuleEndpoints { .. }
         | PolicyMergeError::CannotRemoveBinaryFromAnyBinaryScope { .. } => false,
     }
@@ -1374,7 +1531,12 @@ fn merge_endpoint(
     existing.websocket_credential_rewrite |= incoming.websocket_credential_rewrite;
     existing.request_body_credential_rewrite |= incoming.request_body_credential_rewrite;
     existing.allow_uninspected_credentials |= incoming.allow_uninspected_credentials;
-    existing.advisor_proposed |= incoming.advisor_proposed;
+    // If either declaration came directly from a user or provider, keep the
+    // endpoint explicit. Clearing advisor provenance changes exact-host SSRF
+    // trust, so `ensure_authorization_inheritance_is_declared` only permits
+    // this transition when the incoming rule declares the existing binaries
+    // that will receive that trust.
+    existing.advisor_proposed &= incoming.advisor_proposed;
     normalize_endpoint(existing);
     Ok(())
 }
@@ -1408,7 +1570,8 @@ fn describe_mcp_contract(endpoint: &NetworkEndpoint) -> String {
         || format!("non-mcp(protocol='{}')", endpoint.protocol),
         |contract| {
             format!(
-                "mcp(strict_tool_names={}, allow_all_known_mcp_methods={}, max_body_bytes={})",
+                "mcp(versions={:?}, strict_tool_names={}, allow_all_known_mcp_methods={}, max_body_bytes={})",
+                contract.versions,
                 contract.strict_tool_names,
                 contract.allow_all_known_mcp_methods,
                 contract.max_body_bytes
@@ -1648,7 +1811,13 @@ fn authorization_unit_unchanged(
     merged: &NetworkEndpoint,
     port: Option<u32>,
 ) -> bool {
-    endpoint_authorization_covers_port(existing, merged, port)
+    // Advisor provenance affects whether an exact hostname may resolve to a
+    // private address. Treat clearing it as an authorization change even
+    // though proposal coverage deliberately ignores provenance. Otherwise an
+    // explicit rule for one binary could make advisor-observed binaries on the
+    // same rule eligible for private-address access.
+    existing.advisor_proposed == merged.advisor_proposed
+        && endpoint_authorization_covers_port(existing, merged, port)
         && endpoint_authorization_covers_port(merged, existing, port)
 }
 
@@ -1895,21 +2064,14 @@ fn expand_existing_access(
 }
 
 fn expand_access_preset(protocol: &str, access: &str) -> Option<Vec<L7Rule>> {
-    let methods = match (protocol, access) {
-        (_, "full") => vec!["*"],
-        ("websocket", "read-only") => vec!["GET"],
-        ("websocket", "read-write") => vec!["GET", "WEBSOCKET_TEXT"],
-        (_, "read-only") => vec!["GET", "HEAD", "OPTIONS"],
-        (_, "read-write") => vec!["GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH"],
-        _ => return None,
-    };
+    let methods = openshell_policy_schema::expand_access_preset(protocol, access)?;
 
     Some(
         methods
-            .into_iter()
+            .iter()
             .map(|method| L7Rule {
                 allow: Some(L7Allow {
-                    method: method.to_string(),
+                    method: (*method).to_string(),
                     path: "**".to_string(),
                     command: String::new(),
                     query: HashMap::default(),
@@ -1926,12 +2088,6 @@ fn expand_access_preset(protocol: &str, access: &str) -> Option<Vec<L7Rule>> {
 fn append_unique_binaries(existing: &mut Vec<NetworkBinary>, incoming: &[NetworkBinary]) {
     let mut seen: HashSet<String> = existing.iter().map(|binary| binary.path.clone()).collect();
     for binary in incoming {
-        if let Some(existing_binary) = existing.iter_mut().find(|item| item.path == binary.path) {
-            if !is_advisor_proposed_binary(binary) {
-                mark_user_declared_binary(existing_binary);
-            }
-            continue;
-        }
         if seen.insert(binary.path.clone()) {
             existing.push(binary.clone());
         }
@@ -1979,6 +2135,9 @@ fn normalize_endpoint(endpoint: &mut NetworkEndpoint) {
     dedup_strings(&mut endpoint.allowed_ips);
     dedup_l7_rules(&mut endpoint.rules);
     dedup_deny_rules(&mut endpoint.deny_rules);
+    if let Some(options) = endpoint.mcp.as_mut() {
+        canonicalize_mcp_options(options);
+    }
 }
 
 fn dedup_strings(values: &mut Vec<String>) {
@@ -1987,30 +2146,8 @@ fn dedup_strings(values: &mut Vec<String>) {
 }
 
 fn dedup_binaries(values: &mut Vec<NetworkBinary>) {
-    let mut deduped: Vec<NetworkBinary> = Vec::with_capacity(values.len());
-    for binary in std::mem::take(values) {
-        if let Some(existing) = deduped.iter_mut().find(|item| item.path == binary.path) {
-            if !is_advisor_proposed_binary(&binary) {
-                mark_user_declared_binary(existing);
-            }
-        } else {
-            deduped.push(binary);
-        }
-    }
-    *values = deduped;
-}
-
-fn is_advisor_proposed_binary(binary: &NetworkBinary) -> bool {
-    #[allow(deprecated)]
-    let advisor_proposed = binary.harness;
-    advisor_proposed
-}
-
-fn mark_user_declared_binary(binary: &mut NetworkBinary) {
-    #[allow(deprecated)]
-    {
-        binary.harness = false;
-    }
+    let mut seen = HashSet::new();
+    values.retain(|binary| seen.insert(binary.path.clone()));
 }
 
 fn dedup_l7_rules(values: &mut Vec<L7Rule>) {
@@ -2088,11 +2225,17 @@ mod tests {
         PolicyMergeWarning, canonical_ports, canonicalize_advisor_add_rule, generated_rule_name,
         merge_policy, policy_covers_rule,
     };
-    use crate::restrictive_default_policy;
-    use openshell_core::proto::{
-        L7Allow, L7DenyRule, L7QueryMatcher, L7Rule, McpOptions, NetworkBinary, NetworkEndpoint,
-        NetworkPolicyRule, SandboxPolicy,
+    use crate::{restrictive_default_policy, validate_sandbox_policy};
+    use openshell_core::{
+        mcp::DEFAULT_MCP_PROTOCOL_VERSION,
+        proto::{
+            L7Allow, L7DenyRule, L7QueryMatcher, L7Rule, McpOptions, NetworkBinary,
+            NetworkEndpoint, NetworkPolicyRule, SandboxPolicy,
+        },
     };
+
+    const MCP_VERSION: &str = "2025-03-26";
+    const DEFAULT_MCP_VERSION: &str = DEFAULT_MCP_PROTOCOL_VERSION.as_str();
 
     fn endpoint(host: &str, port: u32) -> NetworkEndpoint {
         NetworkEndpoint {
@@ -2111,18 +2254,6 @@ mod tests {
         }
     }
 
-    fn advisor_binary(path: &str) -> NetworkBinary {
-        let mut binary = NetworkBinary {
-            path: path.to_string(),
-            ..Default::default()
-        };
-        #[allow(deprecated)]
-        {
-            binary.harness = true;
-        }
-        binary
-    }
-
     fn rest_rule(method: &str, path: &str) -> L7Rule {
         L7Rule {
             allow: Some(L7Allow {
@@ -2139,7 +2270,7 @@ mod tests {
     }
 
     #[test]
-    fn canonicalize_advisor_expands_existing_inspected_rule_without_l7_downgrade() {
+    fn canonicalize_advisor_keeps_new_binary_separate_from_explicit_rule() {
         let mut existing_endpoint = endpoint("index.crates.io", 443);
         existing_endpoint.protocol = "rest".to_string();
         existing_endpoint.enforcement = "enforce".to_string();
@@ -2149,7 +2280,6 @@ mod tests {
             endpoints: vec![existing_endpoint.clone()],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/cargo".to_string(),
-                ..Default::default()
             }],
         };
         let mut base = SandboxPolicy::default();
@@ -2161,7 +2291,7 @@ mod tests {
         let incoming = NetworkPolicyRule {
             name: "allow_index_crates_io_443".to_string(),
             endpoints: vec![observed],
-            binaries: vec![advisor_binary("/usr/bin/curl")],
+            binaries: vec![binary("/usr/bin/curl")],
         };
 
         let (rule_name, canonical) = canonicalize_advisor_add_rule(
@@ -2172,13 +2302,116 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(rule_name, "cargo_registry");
-        assert_eq!(canonical.endpoints, vec![existing_endpoint]);
+        assert_eq!(rule_name, "allow_index_crates_io_443");
+        assert_eq!(canonical.endpoints[0].protocol, existing_endpoint.protocol);
+        assert_eq!(canonical.endpoints[0].access, existing_endpoint.access);
+        assert!(canonical.endpoints[0].advisor_proposed);
         assert_eq!(canonical.binaries[0].path, "/usr/bin/curl");
-        #[allow(deprecated)]
-        {
-            assert!(canonical.binaries[0].harness);
-        }
+    }
+
+    #[test]
+    fn canonicalize_advisor_avoids_explicit_requested_key_collision() {
+        let mut base = SandboxPolicy::default();
+        base.network_policies.insert(
+            "allow_index_crates_io_443".to_string(),
+            NetworkPolicyRule {
+                name: "explicit-index".to_string(),
+                endpoints: vec![endpoint("index.crates.io", 443)],
+                binaries: vec![binary("/usr/bin/cargo")],
+            },
+        );
+        let incoming = NetworkPolicyRule {
+            name: "allow_index_crates_io_443".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "index.crates.io".to_string(),
+                port: 443,
+                advisor_proposed: true,
+                ..Default::default()
+            }],
+            binaries: vec![binary("/usr/bin/curl")],
+        };
+
+        let (rule_name, canonical) =
+            canonicalize_advisor_add_rule(&base, &base, "allow_index_crates_io_443", &incoming)
+                .unwrap();
+        assert_eq!(rule_name, "allow_index_crates_io_443_2");
+        assert!(canonical.endpoints[0].advisor_proposed);
+
+        let merged = merge_policy(
+            base,
+            &[PolicyMergeOp::AddRule {
+                rule_name: rule_name.clone(),
+                rule: canonical,
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            merged.policy.network_policies["allow_index_crates_io_443"].binaries,
+            vec![binary("/usr/bin/cargo")]
+        );
+        assert!(merged.policy.network_policies[&rule_name].endpoints[0].advisor_proposed);
+    }
+
+    #[test]
+    fn canonicalize_advisor_reuses_explicit_rule_for_existing_binary() {
+        let existing_endpoint = endpoint("index.crates.io", 443);
+        let existing = NetworkPolicyRule {
+            name: "cargo-registry".to_string(),
+            endpoints: vec![existing_endpoint],
+            binaries: vec![binary("/usr/bin/curl")],
+        };
+        let mut base = SandboxPolicy::default();
+        base.network_policies
+            .insert("cargo_registry".to_string(), existing);
+        let incoming = NetworkPolicyRule {
+            name: "allow_index_crates_io_443".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "index.crates.io".to_string(),
+                port: 443,
+                advisor_proposed: true,
+                ..Default::default()
+            }],
+            binaries: vec![binary("/usr/bin/curl")],
+        };
+
+        let (rule_name, canonical) =
+            canonicalize_advisor_add_rule(&base, &base, "allow_index_crates_io_443", &incoming)
+                .unwrap();
+
+        assert_eq!(rule_name, "cargo_registry");
+        assert!(!canonical.endpoints[0].advisor_proposed);
+    }
+
+    #[test]
+    fn canonicalize_advisor_preserves_existing_advisor_endpoint_provenance() {
+        let mut advisor_endpoint = endpoint("index.crates.io", 443);
+        advisor_endpoint.advisor_proposed = true;
+        let mut base = SandboxPolicy::default();
+        base.network_policies.insert(
+            "advisor_index".to_string(),
+            NetworkPolicyRule {
+                name: "advisor-index".to_string(),
+                endpoints: vec![advisor_endpoint],
+                binaries: vec![binary("/usr/bin/curl")],
+            },
+        );
+        let incoming = NetworkPolicyRule {
+            name: "allow_index_crates_io_443".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "index.crates.io".to_string(),
+                port: 443,
+                advisor_proposed: true,
+                ..Default::default()
+            }],
+            binaries: vec![binary("/usr/bin/curl")],
+        };
+
+        let (rule_name, canonical) =
+            canonicalize_advisor_add_rule(&base, &base, "allow_index_crates_io_443", &incoming)
+                .unwrap();
+
+        assert_eq!(rule_name, "advisor_index");
+        assert!(canonical.endpoints[0].advisor_proposed);
     }
 
     #[test]
@@ -2206,7 +2439,7 @@ mod tests {
                 advisor_proposed: true,
                 ..Default::default()
             }],
-            binaries: vec![advisor_binary("/usr/bin/curl")],
+            binaries: vec![binary("/usr/bin/curl")],
         };
 
         let (rule_name, canonical) =
@@ -2216,10 +2449,64 @@ mod tests {
         assert_eq!(canonical.endpoints[0].protocol, "rest");
         assert_eq!(canonical.endpoints[0].access, "read-only");
         assert!(!canonical.endpoints[0].provider_credentialed);
+        assert!(canonical.endpoints[0].advisor_proposed);
         assert_eq!(
             effective.network_policies["_provider_example"].endpoints[0],
             provider_endpoint
         );
+    }
+
+    #[test]
+    fn canonicalize_advisor_ignores_endpoint_provenance_when_inferring_contract() {
+        let mut provider_endpoint = endpoint("api.example.com", 443);
+        provider_endpoint.protocol = "rest".to_string();
+        provider_endpoint.enforcement = "enforce".to_string();
+        provider_endpoint.access = "read-only".to_string();
+        provider_endpoint.provider_credentialed = true;
+
+        let mut advisor_endpoint = provider_endpoint.clone();
+        advisor_endpoint.provider_credentialed = false;
+        advisor_endpoint.advisor_proposed = true;
+
+        let mut base = SandboxPolicy::default();
+        base.network_policies.insert(
+            "existing_advisor".to_string(),
+            NetworkPolicyRule {
+                name: "existing-advisor".to_string(),
+                endpoints: vec![advisor_endpoint],
+                binaries: vec![binary("/usr/bin/curl")],
+            },
+        );
+
+        let mut effective = base.clone();
+        effective.network_policies.insert(
+            "_provider_example".to_string(),
+            NetworkPolicyRule {
+                name: "provider-example".to_string(),
+                endpoints: vec![provider_endpoint],
+                binaries: vec![binary("/usr/bin/gh")],
+            },
+        );
+
+        let incoming = NetworkPolicyRule {
+            name: "advisor_example".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "api.example.com".to_string(),
+                port: 443,
+                advisor_proposed: true,
+                ..Default::default()
+            }],
+            binaries: vec![binary("/usr/bin/python")],
+        };
+
+        let (rule_name, canonical) =
+            canonicalize_advisor_add_rule(&base, &effective, "advisor_example", &incoming)
+                .expect("provenance alone must not create multiple endpoint contracts");
+
+        assert_eq!(rule_name, "advisor_example");
+        assert_eq!(canonical.endpoints[0].protocol, "rest");
+        assert_eq!(canonical.endpoints[0].access, "read-only");
+        assert!(canonical.endpoints[0].advisor_proposed);
     }
 
     #[test]
@@ -2247,7 +2534,7 @@ mod tests {
                 advisor_proposed: true,
                 ..Default::default()
             }],
-            binaries: vec![advisor_binary("/usr/bin/curl")],
+            binaries: vec![binary("/usr/bin/curl")],
         };
 
         let (rule_name, canonical) = canonicalize_advisor_add_rule(
@@ -2289,7 +2576,6 @@ mod tests {
     fn binary(path: &str) -> NetworkBinary {
         NetworkBinary {
             path: path.to_string(),
-            ..Default::default()
         }
     }
 
@@ -2327,6 +2613,7 @@ mod tests {
             mcp: Some(McpOptions {
                 strict_tool_names,
                 allow_all_known_mcp_methods,
+                versions: vec![MCP_VERSION.to_string()],
             }),
             ..Default::default()
         }
@@ -2348,6 +2635,52 @@ mod tests {
         let mut policy = restrictive_default_policy();
         policy.network_policies.insert(rule_name.to_string(), rule);
         policy
+    }
+
+    fn mcp_endpoint_with_versions(versions: &[&str]) -> NetworkEndpoint {
+        let mut endpoint = mcp_endpoint(
+            "mcp.example.com",
+            &[443],
+            None,
+            None,
+            0,
+            vec![mcp_tool_rule("fixture-tool")],
+        );
+        endpoint
+            .mcp
+            .as_mut()
+            .expect("MCP test endpoint must contain options")
+            .versions = versions.iter().map(ToString::to_string).collect();
+        endpoint
+    }
+
+    fn mcp_endpoint_without_options() -> NetworkEndpoint {
+        let mut endpoint = mcp_endpoint_with_versions(&[]);
+        endpoint.mcp = None;
+        endpoint
+    }
+
+    fn default_mcp_endpoint_representations() -> [(&'static str, NetworkEndpoint); 3] {
+        [
+            ("omitted", mcp_endpoint_without_options()),
+            ("empty", mcp_endpoint_with_versions(&[])),
+            (
+                "explicit default",
+                mcp_endpoint_with_versions(&[DEFAULT_MCP_VERSION]),
+            ),
+        ]
+    }
+
+    fn invalid_explicit_mcp_endpoints() -> Vec<NetworkEndpoint> {
+        let mut misplaced_options = mcp_endpoint_with_versions(&[MCP_VERSION]);
+        misplaced_options.protocol = "rest".to_string();
+
+        vec![
+            mcp_endpoint_with_versions(&[MCP_VERSION, MCP_VERSION]),
+            mcp_endpoint_with_versions(&["latest"]),
+            mcp_endpoint_with_versions(&["2025-03-26 "]),
+            misplaced_options,
+        ]
     }
 
     #[test]
@@ -2399,6 +2732,311 @@ mod tests {
                 port: 443,
             })
         );
+    }
+
+    #[test]
+    fn merge_rejects_invalid_mcp_input_before_operations() {
+        for endpoint in invalid_explicit_mcp_endpoints() {
+            let policy = policy_with_rule(
+                "existing",
+                rule_with_authorizations("existing", vec![endpoint], &["/usr/bin/client"]),
+            );
+            let error = merge_policy(
+                policy,
+                &[PolicyMergeOp::RemoveRule {
+                    rule_name: "existing".to_string(),
+                }],
+            )
+            .expect_err("an operation cannot hide invalid input policy state");
+
+            assert!(matches!(
+                error,
+                PolicyMergeError::InvalidInputPolicy { violations }
+                    if !violations.is_empty()
+            ));
+        }
+    }
+
+    #[test]
+    fn merge_rejects_invalid_mcp_add_rule_before_overlap() {
+        let existing = rule_with_authorizations(
+            "existing",
+            vec![mcp_endpoint_with_versions(&[MCP_VERSION])],
+            &["/usr/bin/client"],
+        );
+
+        for endpoint in invalid_explicit_mcp_endpoints() {
+            let incoming =
+                rule_with_authorizations("existing", vec![endpoint], &["/usr/bin/client"]);
+            let error = merge_policy(
+                policy_with_rule("existing", existing.clone()),
+                &[PolicyMergeOp::AddRule {
+                    rule_name: "existing".to_string(),
+                    rule: incoming,
+                }],
+            )
+            .expect_err("an invalid AddRule must fail before endpoint folding");
+
+            assert!(matches!(
+                error,
+                PolicyMergeError::InvalidOperationPolicy {
+                    operation_index: 0,
+                    violations,
+                } if !violations.is_empty()
+            ));
+        }
+    }
+
+    #[test]
+    fn invalid_mcp_add_rule_reports_its_request_index() {
+        let operations = [
+            PolicyMergeOp::RemoveRule {
+                rule_name: "absent".to_string(),
+            },
+            PolicyMergeOp::AddRule {
+                rule_name: "mcp".to_string(),
+                rule: rule_with_authorizations(
+                    "mcp",
+                    vec![mcp_endpoint_with_versions(&[MCP_VERSION, MCP_VERSION])],
+                    &["/usr/bin/client"],
+                ),
+            },
+        ];
+
+        assert!(matches!(
+            merge_policy(restrictive_default_policy(), &operations),
+            Err(PolicyMergeError::InvalidOperationPolicy {
+                operation_index: 1,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn omitted_empty_and_explicit_default_mcp_versions_are_semantically_equal() {
+        let representations = default_mcp_endpoint_representations();
+        let mut expected_merged_policy = None;
+
+        for (base_label, base_endpoint) in &representations {
+            for (operation_label, operation_endpoint) in &representations {
+                let mut base_endpoint = base_endpoint.clone();
+                base_endpoint.rules = vec![mcp_tool_rule("existing-tool")];
+                let base_rule =
+                    rule_with_authorizations("existing", vec![base_endpoint], &["/usr/bin/client"]);
+                let base_policy = policy_with_rule("existing", base_rule);
+
+                // Coverage and merge are separate public admission boundaries.
+                // Both must resolve the same default before comparing contracts.
+                let mut equivalent_endpoint = operation_endpoint.clone();
+                equivalent_endpoint.rules = vec![mcp_tool_rule("existing-tool")];
+                let equivalent_rule = rule_with_authorizations(
+                    "equivalent",
+                    vec![equivalent_endpoint],
+                    &["/usr/bin/client"],
+                );
+                assert!(
+                    policy_covers_rule(&base_policy, &equivalent_rule),
+                    "{base_label} loaded state must cover an {operation_label} proposal"
+                );
+
+                let mut incoming_endpoint = operation_endpoint.clone();
+                incoming_endpoint.rules = vec![mcp_tool_rule("new-tool")];
+                let incoming_rule = rule_with_authorizations(
+                    "existing",
+                    vec![incoming_endpoint],
+                    &["/usr/bin/client"],
+                );
+                let result = merge_policy(
+                    base_policy,
+                    &[PolicyMergeOp::AddRule {
+                        rule_name: "existing".to_string(),
+                        rule: incoming_rule,
+                    }],
+                )
+                .unwrap_or_else(|error| {
+                    panic!("{base_label} base must merge with {operation_label} operation: {error}")
+                });
+
+                assert!(result.changed);
+                assert_eq!(
+                    result.policy.network_policies["existing"].endpoints[0]
+                        .mcp
+                        .as_ref()
+                        .expect("canonical MCP output must contain explicit options")
+                        .versions,
+                    [DEFAULT_MCP_VERSION],
+                    "{base_label} base and {operation_label} operation must materialize the pinned default"
+                );
+                if let Some(expected) = expected_merged_policy.as_ref() {
+                    assert_eq!(
+                        &result.policy, expected,
+                        "{base_label} base and {operation_label} operation must have one canonical result"
+                    );
+                } else {
+                    expected_merged_policy = Some(result.policy);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_non_default_mcp_allowlists_conflict_with_the_materialized_default() {
+        let expected_default_contract = format!(
+            "mcp(versions=[\"{DEFAULT_MCP_VERSION}\"], strict_tool_names=true, allow_all_known_mcp_methods=false, max_body_bytes={DEFAULT_JSON_RPC_MAX_BODY_BYTES})"
+        );
+
+        for versions in [
+            &["2025-03-26"][..],
+            &["2025-03-26", DEFAULT_MCP_VERSION][..],
+        ] {
+            let existing = rule_with_authorizations(
+                "existing",
+                vec![mcp_endpoint_without_options()],
+                &["/usr/bin/client"],
+            );
+            let incoming = rule_with_authorizations(
+                "existing",
+                vec![mcp_endpoint_with_versions(versions)],
+                &["/usr/bin/client"],
+            );
+
+            let error = merge_policy(
+                policy_with_rule("existing", existing),
+                &[PolicyMergeOp::AddRule {
+                    rule_name: "existing".to_string(),
+                    rule: incoming,
+                }],
+            )
+            .expect_err("an explicit non-default allowlist must remain a distinct contract");
+
+            match error {
+                PolicyMergeError::McpContractConflict {
+                    operation_index,
+                    existing,
+                    incoming,
+                    ..
+                } => {
+                    assert_eq!(operation_index, 0);
+                    assert_eq!(existing, expected_default_contract);
+                    assert!(
+                        versions.iter().all(|version| incoming.contains(*version)),
+                        "incoming contract must render every explicit revision: {incoming}"
+                    );
+                }
+                other => panic!("expected an MCP contract conflict, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn merge_canonicalizes_equivalent_mcp_version_order() {
+        let existing = rule_with_authorizations(
+            "existing",
+            vec![mcp_endpoint_with_versions(&[
+                "2025-11-25",
+                "2025-03-26",
+                "2025-06-18",
+            ])],
+            &["/usr/bin/trusted"],
+        );
+        let incoming = rule_with_authorizations(
+            "existing",
+            vec![mcp_endpoint_with_versions(&[
+                "2025-06-18",
+                "2025-11-25",
+                "2025-03-26",
+            ])],
+            &["/usr/bin/new"],
+        );
+
+        let result = merge_policy(
+            policy_with_rule("existing", existing),
+            &[PolicyMergeOp::AddRule {
+                rule_name: "existing".to_string(),
+                rule: incoming,
+            }],
+        )
+        .expect("equivalent complete MCP contracts must merge");
+
+        assert!(result.changed);
+        assert!(validate_sandbox_policy(&result.policy).is_ok());
+        assert_eq!(
+            result.policy.network_policies["existing"].endpoints[0]
+                .mcp
+                .as_ref()
+                .expect("MCP endpoint must retain options")
+                .versions,
+            ["2025-03-26", "2025-06-18", "2025-11-25"]
+        );
+    }
+
+    #[test]
+    fn canonicalizing_input_order_is_not_a_policy_change() {
+        let input = policy_with_rule(
+            "mcp",
+            rule_with_authorizations(
+                "mcp",
+                vec![mcp_endpoint_with_versions(&[
+                    "2025-11-25",
+                    "2025-03-26",
+                    "2025-06-18",
+                ])],
+                &["/usr/bin/client"],
+            ),
+        );
+
+        let result = merge_policy(input, &[]).expect("valid input must canonicalize");
+
+        assert!(!result.changed);
+        assert_eq!(
+            result.policy.network_policies["mcp"].endpoints[0]
+                .mcp
+                .as_ref()
+                .expect("MCP endpoint must retain options")
+                .versions,
+            ["2025-03-26", "2025-06-18", "2025-11-25"]
+        );
+    }
+
+    #[test]
+    fn policy_coverage_fails_closed_for_invalid_mcp_contracts() {
+        let loaded_rule = rule_with_authorizations(
+            "loaded",
+            vec![mcp_endpoint_with_versions(&[
+                "2025-03-26",
+                "2025-06-18",
+                "2025-11-25",
+            ])],
+            &["/usr/bin/client"],
+        );
+        let loaded = policy_with_rule("loaded", loaded_rule);
+
+        for endpoint in invalid_explicit_mcp_endpoints() {
+            let proposed =
+                rule_with_authorizations("proposed", vec![endpoint], &["/usr/bin/client"]);
+            assert!(!policy_covers_rule(&loaded, &proposed));
+        }
+
+        let equivalent = rule_with_authorizations(
+            "proposed",
+            vec![mcp_endpoint_with_versions(&[
+                "2025-11-25",
+                "2025-03-26",
+                "2025-06-18",
+            ])],
+            &["/usr/bin/client"],
+        );
+        assert!(policy_covers_rule(&loaded, &equivalent));
+
+        let invalid_loaded = policy_with_rule(
+            "loaded",
+            rule_with_authorizations(
+                "loaded",
+                vec![mcp_endpoint_with_versions(&[MCP_VERSION, MCP_VERSION])],
+                &["/usr/bin/client"],
+            ),
+        );
+        assert!(!policy_covers_rule(&invalid_loaded, &equivalent));
     }
 
     #[test]
@@ -2678,6 +3316,7 @@ mod tests {
             Some(McpOptions {
                 strict_tool_names: Some(false),
                 allow_all_known_mcp_methods: Some(true),
+                versions: vec![MCP_VERSION.to_string()],
             })
         );
         assert_eq!(promoted.rules, vec![mcp_tool_rule("new-tool")]);
@@ -3025,7 +3664,7 @@ mod tests {
     }
 
     #[test]
-    fn policy_coverage_requires_endpoint_advisor_provenance_to_be_loaded() {
+    fn policy_coverage_ignores_endpoint_advisor_provenance() {
         let loaded_endpoint = endpoint("api.example.com", 443);
         let mut proposed_endpoint = loaded_endpoint.clone();
         proposed_endpoint.advisor_proposed = true;
@@ -3036,7 +3675,37 @@ mod tests {
         let proposed =
             rule_with_authorizations("proposed", vec![proposed_endpoint], &["/usr/bin/client"]);
 
-        assert!(!policy_covers_rule(&loaded, &proposed));
+        assert!(policy_covers_rule(&loaded, &proposed));
+    }
+
+    #[test]
+    fn explicit_endpoint_provenance_wins_in_either_merge_order() {
+        let explicit_endpoint = endpoint("api.example.com", 443);
+        let mut proposed_endpoint = explicit_endpoint.clone();
+        proposed_endpoint.advisor_proposed = true;
+
+        for (existing_endpoint, incoming_endpoint) in [
+            (explicit_endpoint.clone(), proposed_endpoint.clone()),
+            (proposed_endpoint, explicit_endpoint),
+        ] {
+            let incoming =
+                rule_with_authorizations("api", vec![incoming_endpoint], &["/usr/bin/client"]);
+            let merged = merge_policy(
+                policy_with_rule(
+                    "api",
+                    rule_with_authorizations("api", vec![existing_endpoint], &["/usr/bin/client"]),
+                ),
+                &[PolicyMergeOp::AddRule {
+                    rule_name: "api".to_string(),
+                    rule: incoming.clone(),
+                }],
+            )
+            .expect("compatible explicit and advisor rules should merge");
+
+            let endpoint = &merged.policy.network_policies["api"].endpoints[0];
+            assert!(!endpoint.advisor_proposed);
+            assert!(policy_covers_rule(&merged.policy, &incoming));
+        }
     }
 
     #[test]
@@ -3090,7 +3759,6 @@ mod tests {
                 endpoints: vec![endpoint("api.github.com", 443)],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/curl".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -3127,14 +3795,14 @@ mod tests {
     }
 
     #[test]
-    fn add_rule_user_binary_clears_advisor_marker_for_same_path() {
+    fn add_rule_deduplicates_binary_path() {
         let mut policy = restrictive_default_policy();
         policy.network_policies.insert(
             "existing".to_string(),
             NetworkPolicyRule {
                 name: "existing".to_string(),
                 endpoints: vec![endpoint("api.github.com", 443)],
-                binaries: vec![advisor_binary("/usr/bin/curl")],
+                binaries: vec![binary("/usr/bin/curl")],
             },
         );
 
@@ -3143,7 +3811,6 @@ mod tests {
             endpoints: vec![endpoint("api.github.com", 443)],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
 
@@ -3158,22 +3825,18 @@ mod tests {
 
         let rule = &result.policy.network_policies["existing"];
         assert_eq!(rule.binaries.len(), 1);
-        #[allow(deprecated)]
-        {
-            assert!(!rule.binaries[0].harness);
-        }
+        assert_eq!(rule.binaries[0].path, "/usr/bin/curl");
     }
 
     #[test]
-    fn add_rule_duplicate_binaries_prefer_user_declared_marker() {
+    fn add_rule_deduplicates_binary_paths_within_incoming_rule() {
         let incoming = NetworkPolicyRule {
             name: "incoming".to_string(),
             endpoints: vec![endpoint("api.github.com", 443)],
             binaries: vec![
-                advisor_binary("/usr/bin/curl"),
+                binary("/usr/bin/curl"),
                 NetworkBinary {
                     path: "/usr/bin/curl".to_string(),
-                    ..Default::default()
                 },
             ],
         };
@@ -3189,10 +3852,7 @@ mod tests {
 
         let rule = &result.policy.network_policies["github"];
         assert_eq!(rule.binaries.len(), 1);
-        #[allow(deprecated)]
-        {
-            assert!(!rule.binaries[0].harness);
-        }
+        assert_eq!(rule.binaries[0].path, "/usr/bin/curl");
     }
 
     #[test]
@@ -3205,7 +3865,6 @@ mod tests {
                 endpoints: vec![endpoint("api.example.com", 443)],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/python".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -3219,7 +3878,7 @@ mod tests {
                 advisor_proposed: true,
                 ..Default::default()
             }],
-            binaries: vec![advisor_binary("/usr/bin/python")],
+            binaries: vec![binary("/usr/bin/python")],
         };
 
         let result = merge_policy(
@@ -3233,13 +3892,7 @@ mod tests {
 
         let rule = &result.policy.network_policies["app-api"];
         assert_eq!(rule.binaries.len(), 1, "binary should still dedupe");
-        #[allow(deprecated)]
-        {
-            assert!(
-                !rule.binaries[0].harness,
-                "existing user binary provenance should be retained"
-            );
-        }
+        assert_eq!(rule.binaries[0].path, "/usr/bin/python");
         let internal_endpoint = rule
             .endpoints
             .iter()
@@ -3277,6 +3930,7 @@ mod tests {
                 port: 443,
                 ports: vec![443],
                 protocol: "websocket".to_string(),
+                access: "read-write".to_string(),
                 websocket_credential_rewrite: true,
                 ..Default::default()
             }],
@@ -3322,6 +3976,7 @@ mod tests {
                 port: 443,
                 ports: vec![443],
                 protocol: "rest".to_string(),
+                access: "read-write".to_string(),
                 request_body_credential_rewrite: true,
                 ..Default::default()
             }],
@@ -3587,7 +4242,6 @@ mod tests {
                 endpoints: vec![endpoint("api.github.com", 443)],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/gh".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -3611,7 +4265,6 @@ mod tests {
             endpoints: vec![endpoint("api.github.com", 443)],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
 
@@ -3634,7 +4287,6 @@ mod tests {
             endpoints: vec![endpoint("api.github.com", 443)],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
 
@@ -3664,7 +4316,6 @@ mod tests {
             endpoints: vec![endpoint("api.github.com", 443)],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
 
@@ -3676,7 +4327,6 @@ mod tests {
                 endpoints: vec![endpoint("api.github.com", 443)],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/git".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -3707,7 +4357,6 @@ mod tests {
             endpoints: vec![endpoint("api.github.com", 443)],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
 
@@ -3722,7 +4371,6 @@ mod tests {
                 endpoints: vec![endpoint("api.github.com", 443)],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/git".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -3758,7 +4406,6 @@ mod tests {
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
 
@@ -3777,7 +4424,6 @@ mod tests {
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/curl".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -3804,7 +4450,6 @@ mod tests {
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
 
@@ -3826,7 +4471,6 @@ mod tests {
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/curl".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -3849,7 +4493,6 @@ mod tests {
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/git".to_string(),
-                ..Default::default()
             }],
         };
 
@@ -3883,7 +4526,6 @@ mod tests {
                 endpoints: vec![endpoint("api.github.com", 443)],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/curl".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -3948,7 +4590,6 @@ mod tests {
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/gh".to_string(),
-                ..Default::default()
             }],
         };
         let composed = compose_effective_policy(
@@ -3979,7 +4620,6 @@ mod tests {
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
         let result = merge_policy(
@@ -4047,7 +4687,6 @@ mod tests {
             endpoints: vec![endpoint("api.github.com", 443)],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         };
         let result = merge_policy(
@@ -4091,6 +4730,120 @@ mod tests {
         );
     }
 
+    #[test]
+    fn add_rule_keeps_advisor_binary_separate_from_explicit_endpoint() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "cargo_registry".to_string(),
+            NetworkPolicyRule {
+                name: "cargo-registry".to_string(),
+                endpoints: vec![endpoint("index.crates.io", 443)],
+                binaries: vec![binary("/usr/bin/cargo")],
+            },
+        );
+
+        let mut advisor_endpoint = endpoint("index.crates.io", 443);
+        advisor_endpoint.advisor_proposed = true;
+        let result = merge_policy(
+            policy,
+            &[PolicyMergeOp::AddRule {
+                rule_name: "allow_index_crates_io_443".to_string(),
+                rule: NetworkPolicyRule {
+                    name: "allow_index_crates_io_443".to_string(),
+                    endpoints: vec![advisor_endpoint],
+                    binaries: vec![binary("/usr/bin/curl")],
+                },
+            }],
+        )
+        .expect("advisor rule should remain separate");
+
+        let explicit = &result.policy.network_policies["cargo_registry"];
+        assert!(!explicit.endpoints[0].advisor_proposed);
+        assert_eq!(explicit.binaries, vec![binary("/usr/bin/cargo")]);
+
+        let advisor = &result.policy.network_policies["allow_index_crates_io_443"];
+        assert!(advisor.endpoints[0].advisor_proposed);
+        assert_eq!(advisor.binaries, vec![binary("/usr/bin/curl")]);
+    }
+
+    #[test]
+    fn add_rule_keeps_explicit_binary_separate_from_advisor_endpoint() {
+        let mut advisor_endpoint = endpoint("index.crates.io", 443);
+        advisor_endpoint.advisor_proposed = true;
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "advisor_index".to_string(),
+            NetworkPolicyRule {
+                name: "advisor-index".to_string(),
+                endpoints: vec![advisor_endpoint],
+                binaries: vec![binary("/usr/bin/curl")],
+            },
+        );
+
+        let result = merge_policy(
+            policy,
+            &[PolicyMergeOp::AddRule {
+                rule_name: "explicit_index".to_string(),
+                rule: NetworkPolicyRule {
+                    name: "explicit-index".to_string(),
+                    endpoints: vec![endpoint("index.crates.io", 443)],
+                    binaries: vec![binary("/usr/bin/wget")],
+                },
+            }],
+        )
+        .expect("explicit authorization should remain separate");
+
+        let advisor = &result.policy.network_policies["advisor_index"];
+        assert!(advisor.endpoints[0].advisor_proposed);
+        assert_eq!(advisor.binaries, vec![binary("/usr/bin/curl")]);
+
+        let explicit = &result.policy.network_policies["explicit_index"];
+        assert!(!explicit.endpoints[0].advisor_proposed);
+        assert_eq!(explicit.binaries, vec![binary("/usr/bin/wget")]);
+        assert!(result.warnings.iter().any(|warning| matches!(
+            warning,
+            PolicyMergeWarning::KeptRequestedRuleNameToAvoidWidening {
+                rule_name,
+                overlapping_rule_name,
+                ..
+            } if rule_name == "explicit_index" && overlapping_rule_name == "advisor_index"
+        )));
+    }
+
+    #[test]
+    fn add_rule_rejects_clearing_advisor_provenance_for_undeclared_binary() {
+        let mut advisor_endpoint = endpoint("index.crates.io", 443);
+        advisor_endpoint.advisor_proposed = true;
+        let policy = policy_with_rule(
+            "advisor_index",
+            NetworkPolicyRule {
+                name: "advisor-index".to_string(),
+                endpoints: vec![advisor_endpoint],
+                binaries: vec![binary("/usr/bin/curl")],
+            },
+        );
+
+        let result = merge_policy(
+            policy,
+            &[PolicyMergeOp::AddRule {
+                rule_name: "advisor_index".to_string(),
+                rule: NetworkPolicyRule {
+                    name: "advisor-index".to_string(),
+                    endpoints: vec![endpoint("index.crates.io", 443)],
+                    binaries: vec![binary("/usr/bin/wget")],
+                },
+            }],
+        );
+
+        assert!(matches!(
+            result,
+            Err(PolicyMergeError::ExistingBinariesWouldInheritAuthorization {
+                undeclared_binaries,
+                ..
+            }) if undeclared_binaries == ["/usr/bin/curl"]
+        ));
+    }
+
     fn endpoint_with_ports(host: &str, ports: &[u32]) -> NetworkEndpoint {
         NetworkEndpoint {
             host: host.to_string(),
@@ -4118,6 +4871,7 @@ mod tests {
                 "protocol",
                 NetworkEndpoint {
                     protocol: "rest".to_string(),
+                    access: "read-write".to_string(),
                     ..endpoint("api.example.com", 443)
                 },
             ),
@@ -4570,6 +5324,7 @@ mod tests {
                 "protocol",
                 NetworkEndpoint {
                     protocol: "rest".to_string(),
+                    access: "read-write".to_string(),
                     ..endpoint("api.example.com", 443)
                 },
             ),
@@ -4644,6 +5399,7 @@ mod tests {
             "existing",
             vec![NetworkEndpoint {
                 protocol: "rest".to_string(),
+                access: "read-write".to_string(),
                 ..endpoint("api.example.com", 443)
             }],
             &["/usr/bin/trusted"],
@@ -4652,6 +5408,7 @@ mod tests {
             "existing",
             vec![NetworkEndpoint {
                 protocol: "websocket".to_string(),
+                access: "read-write".to_string(),
                 ..endpoint("api.example.com", 443)
             }],
             &["/usr/bin/trusted", "/usr/bin/second"],
@@ -5154,6 +5911,82 @@ mod tests {
         .expect("an unrelated endpoint must not inherit a baseline conflict");
     }
 
+    /// A baseline conflict does not license later operations to add another
+    /// incompatible contract at the same host and port.
+    #[test]
+    fn a_preexisting_mcp_conflict_does_not_license_a_new_revision_contract() {
+        let mut policy = policy_with_rule(
+            "first_rule",
+            rule_with_authorizations(
+                "first_rule",
+                vec![mcp_endpoint(
+                    "mcp.example.com",
+                    &[443],
+                    None,
+                    None,
+                    65_536,
+                    vec![mcp_tool_rule("first")],
+                )],
+                &["/usr/bin/a"],
+            ),
+        );
+        policy.network_policies.insert(
+            "second_rule".to_string(),
+            rule_with_authorizations(
+                "second_rule",
+                vec![NetworkEndpoint {
+                    path: "/other".to_string(),
+                    ..mcp_endpoint(
+                        "mcp.example.com",
+                        &[443],
+                        None,
+                        None,
+                        131_072,
+                        vec![mcp_tool_rule("second")],
+                    )
+                }],
+                &["/usr/bin/b"],
+            ),
+        );
+
+        let error = merge_policy(
+            policy,
+            &[PolicyMergeOp::AddRule {
+                rule_name: "third_rule".to_string(),
+                rule: rule_with_authorizations(
+                    "third_rule",
+                    vec![NetworkEndpoint {
+                        path: "/third".to_string(),
+                        json_rpc_max_body_bytes: 65_536,
+                        rules: vec![mcp_tool_rule("third")],
+                        ..mcp_endpoint_with_versions(&["2025-06-18"])
+                    }],
+                    &["/usr/bin/c"],
+                ),
+            }],
+        )
+        .expect_err("a new revision contract must not hide behind a baseline conflict");
+
+        match error {
+            PolicyMergeError::ConflictingInspectionContracts {
+                host,
+                port,
+                contracts,
+            } => {
+                assert_eq!(host, "mcp.example.com");
+                assert_eq!(port, 443);
+                assert_eq!(contracts.len(), 3);
+                assert!(
+                    contracts
+                        .iter()
+                        .any(|contract| contract.contains("2025-06-18")),
+                    "the diagnostic must include the newly introduced revision contract"
+                );
+            }
+            other => panic!("expected an inspection-contract conflict, got {other:?}"),
+        }
+    }
+
     /// An additive operation must never revoke access. Appending a named binary
     /// to a rule that authorizes any binary would restrict it to that one path.
     #[test]
@@ -5365,6 +6198,7 @@ mod tests {
             vec![NetworkEndpoint {
                 path: "/graphql".to_string(),
                 protocol: "graphql".to_string(),
+                access: "read-only".to_string(),
                 ..endpoint("api.github.com", 443)
             }],
             &["/usr/bin/only"],

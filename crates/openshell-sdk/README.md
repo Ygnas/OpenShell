@@ -9,9 +9,10 @@ gateway-name resolution.
 ## Two layers
 
 - `OpenShellClient` — the curated, sandbox-focused surface: health, sandbox
-  CRUD, readiness/deletion waits, and non-streaming exec.
+  CRUD, reusable sandbox template CRUD, readiness/deletion waits, and
+  non-streaming exec.
 - `raw` — direct access to the generated tonic clients for RPCs the curated
-  surface doesn't yet cover (inference, providers, policy, logs, settings, SSH,
+  surface doesn't yet cover (providers, policy, logs, settings, SSH,
   forwarding).
 
 ## Auth and refresh
@@ -20,9 +21,8 @@ The curated surface drives OIDC refresh automatically: proactively before a
 request and reactively on `Unauthenticated`. Refreshes are single-flight, so
 only one is in flight at a time.
 
-The plain `raw_grpc`/`raw_inference` accessors do not refresh; they return a
-client bound to the current token. When a refresher is wired, use
-`raw_grpc_fresh`/`raw_inference_fresh` to refresh before the call, and
+The plain `raw_grpc` accessor does not refresh; it returns a client bound to
+the current token. When a refresher is wired, use `raw_grpc_fresh` to refresh before the call, and
 `force_refresh` to recover after a raw RPC returns `Unauthenticated`.
 
 The SDK consumes a `Refresh` trait that the caller implements; it does not run
@@ -43,11 +43,92 @@ mTLS (client certificates) is not supported.
 ## Public surface
 
 `OpenShellClient::connect(ClientConfig)` returns a connected client exposing
-`health`, `create_sandbox`, `get_sandbox`, `list_sandboxes`, `delete_sandbox`,
+`health`, `create_sandbox`, `get_sandbox`, `list_sandboxes`, `list_all_sandboxes`, `delete_sandbox`,
+`create_sandbox_from_template`, `create_sandbox_template`,
+`get_sandbox_template`, `list_sandbox_templates`, `delete_sandbox_template`,
+`list_sandboxes_all_workspaces`, `list_sandbox_templates_all_workspaces`,
 `wait_ready`, `wait_deleted`, and `exec`. Curated types (`SandboxSpec`,
-`SandboxRef`, `Health`, `ListOptions`, `ExecOptions`, `SandboxPhase`) use
-SDK-shaped enums rather than raw proto integers. Failures map to a typed
-`SdkError` with a discriminable kind.
+`SandboxRef`, `Health`, `ListOptions`, `SandboxTemplateListOptions`,
+`ExecOptions`, `SandboxPhase`) use SDK-shaped enums rather than raw proto
+integers where practical. Reusable template resources are exposed as
+`SandboxWorkloadTemplate` proto aliases so callers can populate the full
+portable workload shape and driver config. Failures map to a typed `SdkError`
+with a discriminable kind.
+
+Curated calls without a workspace argument explicitly select the `default`
+workspace. Cross-workspace listing uses the separate `*_all_workspaces`
+methods and requires Platform Admin access.
+
+For an accepted sandbox deletion, pass its original ID to `wait_deleted` so a
+same-name replacement does not extend the wait. Both the default and
+workspace-scoped clients accept the optional third argument; pass `None` to wait
+for name absence instead.
+
+```rust
+let deletion = client.delete_sandbox(name, openshell_sdk::DeleteOptions::default()).await?;
+if deletion.outcome == openshell_sdk::DeletionOutcome::Accepted {
+    client.wait_deleted(
+        name,
+        std::time::Duration::from_secs(60),
+        deletion.sandbox_id.as_deref(),
+    ).await?;
+}
+```
+
+Curated `list_*` methods return a lazy `Pager<T>`. Each `next_page()` call
+issues at most one RPC and returns a `Page<T>` with its opaque continuation
+token. The explicit `list_all_*` conveniences exhaust that pager; `page_size`
+always controls one gateway request, and `page_token` resumes a saved traversal.
+
+```rust
+let mut pages = client.list_sandboxes(ListOptions {
+    page_size: 100,
+    ..Default::default()
+});
+while let Some(page) = pages.next_page().await? {
+    for sandbox in page.items {
+        println!("{}", sandbox.name);
+    }
+}
+```
+
+```rust
+use openshell_sdk::{
+    ClientConfig, OpenShellClient, SandboxTemplateCreateSpec,
+    SandboxWorkloadConfig, SandboxWorkloadTemplate, SandboxWorkloadTemplateSpec,
+};
+
+# async fn run() -> Result<(), openshell_sdk::SdkError> {
+let client = OpenShellClient::connect(ClientConfig::new("http://127.0.0.1:8080")).await?;
+client
+    .create_sandbox_template(SandboxWorkloadTemplate {
+        metadata: Some(openshell_sdk::raw::proto::datamodel::v1::ObjectMeta {
+            name: "python".to_string(),
+            ..Default::default()
+        }),
+        spec: Some(SandboxWorkloadTemplateSpec {
+            workload: Some(SandboxWorkloadConfig {
+                image: "ghcr.io/nvidia/openshell-community/sandboxes/python:latest".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+    })
+    .await?;
+
+let _sandbox = client
+    .create_sandbox_from_template(SandboxTemplateCreateSpec {
+        template_name: "python".to_string(),
+        policy: Some(openshell_sdk::raw::proto::SandboxPolicy {
+            version: 1,
+            ..Default::default()
+        }),
+        ..Default::default()
+    })
+    .await?;
+# Ok(())
+# }
+```
 
 ## Modules
 
@@ -61,6 +142,7 @@ SDK-shaped enums rather than raw proto integers. Failures map to a typed
 | `refresh` | `Refresh` trait and single-flight refresh coalescing. |
 | `edge_tunnel` | Cloudflare Access tunnel dialer. |
 | `error` | `SdkError` taxonomy. |
+| `pagination` | Lazy `Pager<T>` and response `Page<T>`. |
 | `types` | Curated request/response types and proto conversions. |
 | `raw` | Escape hatch re-exporting the generated tonic clients. |
 

@@ -23,9 +23,11 @@ openshell sandbox create -- claude
 The trailing command is the sandbox's canonical main process. OpenShell starts
 it once, streams its output, and returns its exit status. Exit code 0 leaves a
 retained sandbox in `Completed`; a nonzero exit leaves it in `Error` with a
-`MainProcessFailed` condition. With no trailing command, OpenShell
-starts `/bin/bash -l` in a retained pseudo-terminal. Add `--detach` to create
-the sandbox without attaching:
+`MainProcessFailed` condition. With no trailing command, OpenShell starts a
+login shell in a retained pseudo-terminal: `/bin/bash -l` when the image
+provides bash, otherwise a shell detected in the image such as `/bin/sh` on
+minimal bases like Alpine. Add `--detach` to create the sandbox without
+attaching:
 
 ```shell
 openshell sandbox create --name worker --detach -- ./worker
@@ -43,6 +45,17 @@ captures the command result, and deletes the sandbox after the command exits:
 ```shell
 openshell sandbox create --no-keep -- sh -c 'echo done; exit 0'
 ```
+
+Combine `--detach` and `--no-keep` for a background workload whose lifecycle
+belongs entirely to the gateway:
+
+```shell
+openshell sandbox create --detach --no-keep -- ./worker
+```
+
+The create command returns after the workload is ready. The gateway keeps the
+canonical process running without a host-side attachment and deletes the
+sandbox after that process exits.
 
 `--upload` cannot yet be combined with a trailing main command because uploads
 finish after the canonical process starts. Create a scratch sandbox, upload the
@@ -142,20 +155,127 @@ openshell sandbox create \
 
 ### Custom Containers
 
-Use `--from` to create a sandbox from the base image, another pre-built sandbox name, a local directory, or a container image:
+Use `--from` to create a sandbox from the base image, another pre-built sandbox name, a rootfs tar archive, or a container image:
 
 ```shell
 openshell sandbox create --from base
 openshell sandbox create --from ollama
-openshell sandbox create --from ./my-sandbox-dir
+openshell sandbox create --from ./rootfs.tar
 openshell sandbox create --from my-registry.example.com/my-image:latest
 ```
 
 Bare names such as `base` and `ollama` resolve to images under `ghcr.io/nvidia/openshell-community/sandboxes`. Set `OPENSHELL_COMMUNITY_REGISTRY` when you need to use an internal mirror.
 
-Local directories and Dockerfiles require a local gateway because the CLI builds
-through the local Docker daemon. Use a registry image reference for remote
-gateways.
+`--from` does not build local Dockerfiles or directories. Build and tag the
+image with the container engine used by your local gateway, then pass the
+resulting image reference:
+
+```shell
+# Docker gateway
+docker build -t my-image:latest .
+openshell sandbox create --from my-image:latest
+
+# Podman gateway
+podman build -t localhost/my-image:latest .
+openshell sandbox create --from localhost/my-image:latest
+```
+
+For a remote gateway, push the image to a registry that the gateway can pull
+from and use that registry image reference.
+
+<Warning>
+**Pre-0.1.0 breaking change:** `openshell sandbox create --from ./Dockerfile`
+and directory sources no longer build images. Build and tag the image before
+you create the sandbox.
+</Warning>
+
+#### Rootfs Tar Archives
+
+A rootfs tar archive (`.tar`, `.tar.gz`, `.tgz`) is a flat filesystem produced
+by `docker export`, `podman export`, or `buildah mount` plus `tar`. It lets you
+create a sandbox without a registry or a running image daemon:
+
+```shell
+docker create --name export-me my-image:latest
+docker export -o rootfs.tar export-me
+docker rm export-me
+
+openshell sandbox create --from ./rootfs.tar
+```
+
+Rootfs tar sources require a local gateway running the VM compute driver. The
+CLI asks the gateway for a staging slot, writes the archive to the location the
+gateway allocates, and passes back a single-use token; the gateway resolves that
+token to a path for the driver. Because the CLI writes the archive directly to
+the gateway host's filesystem, the two must share a filesystem and run as the
+same user. Gateways using the Docker, Podman, or Kubernetes drivers reject
+rootfs tar sources.
+
+Gzip-compressed archives (`.tar.gz`, `.tgz`) are decompressed while the gateway
+stages them, so the sandbox sees the same filesystem either way. Compression is
+detected from the archive contents, not the file name.
+
+The gateway caps archive size (10 GiB by default, configurable with the VM
+driver's `rootfs_tar_max_bytes`), and reclaims an unused staging slot after 30
+minutes. The cap applies to the expanded archive too: a compressed source that
+decompresses past the limit is rejected.
+
+## Reuse Workload Templates
+
+Sandbox workload templates let workspace admins define reusable runtime shapes for a workspace. A template stores the image, environment, resource requests, and driver-specific configuration that sandboxes should inherit. When you create a sandbox from a template, the create request can still attach providers, labels, and policy, but the workload comes from the named template.
+
+Create a template:
+
+```shell
+openshell sandbox template create gpu-kata \
+  --image registry.example.com/agent:latest \
+  --cpu 2 \
+  --memory 4Gi \
+  --gpu 1 \
+  --label team=runtime \
+  --env FEATURE_FLAG=on
+```
+
+Use `--gpu` without a count when the template should request the active
+driver's default GPU assignment. Use `--gpu COUNT` when the template needs a
+specific number of GPUs.
+
+Add driver-specific settings when the active compute driver needs them:
+
+```shell
+openshell sandbox template create gpu-kata \
+  --image registry.example.com/agent:latest \
+  --driver-config-json '{"kubernetes":{"pod":{"runtime_class_name":"kata-containers","node_selector":{"pool":"gpu"}}}}'
+```
+
+If you omit `--image`, the gateway applies its default sandbox image when a sandbox is created from the template. Use this when the template should only define resource, environment, or driver settings.
+
+Create a sandbox from a template:
+
+```shell
+openshell sandbox create --template gpu-kata --provider github -- claude
+```
+
+The `--template` flag cannot be combined with inline workload flags such as `--from`, `--cpu`, `--memory`, `--gpu`, `--env`, or `--driver-config-json`. Put those values on the template instead. Create-time policy and provider attachments remain part of the sandbox request, so each sandbox can keep its own access boundary.
+
+Inspect and manage templates:
+
+```shell
+openshell sandbox template list
+openshell sandbox template list --label-selector team=runtime
+openshell sandbox template get gpu-kata
+openshell sandbox template delete gpu-kata
+```
+
+Use `--all-workspaces` with `sandbox template list` when you need an admin view across workspaces:
+
+```shell
+openshell sandbox template list --all-workspaces
+```
+
+For JSON or YAML, template list output contains `templates` and
+`next_page_token` fields. Pass the returned token to `--page-token` to
+continue.
 
 ## Base Sandbox Container
 
@@ -221,14 +341,27 @@ openshell sandbox exec -n my-sandbox --tty -- /bin/bash
 
 OpenShell allocates a TTY automatically when both stdin and stdout are terminals. Force the behavior with `--tty` or disable it with `--no-tty`.
 
-| Flag           | Purpose                                                  |
-| -------------- | -------------------------------------------------------- |
-| `-n`, `--name` | Sandbox to target.                                       |
-| `--workdir`    | Working directory for the command inside the sandbox.    |
-| `--timeout`    | Command timeout in seconds. `0` disables the timeout.    |
-| `--tty`        | Force TTY allocation.                                    |
-| `--no-tty`     | Disable TTY allocation even when attached to a terminal. |
-| `--env`        | Set an environment variable for the command (`KEY=VALUE`, repeatable). |
+| Flag              | Purpose                                                  |
+| ----------------- | -------------------------------------------------------- |
+| `-n`, `--name`    | Sandbox to target.                                       |
+| `--workdir`       | Working directory for the command inside the sandbox.    |
+| `--timeout`       | Command timeout in seconds. `0` disables the timeout.    |
+| `--tty`           | Force TTY allocation.                                    |
+| `--no-tty`        | Disable TTY allocation even when attached to a terminal. |
+| `--no-login-shell`| Run the command without sourcing shell login startup files. |
+| `--env`           | Set an environment variable for the command (`KEY=VALUE`, repeatable). |
+
+### Skip shell startup files
+
+By default `sandbox exec` runs the command through a login shell (`bash -lc`), so the sandbox user's first available `.bash_profile`, `.bash_login`, or `.profile` is sourced first (and `.bashrc` only if that login file sources it). This makes tool-specific environment configuration available automatically, which suits interactive and tool-discovery use.
+
+For automation and managed checks that need predictable output and side effects, pass `--no-login-shell` so those startup files are not sourced before the command runs:
+
+```shell
+openshell sandbox exec -n my-sandbox --no-login-shell -- /usr/local/bin/managed-probe
+```
+
+In this mode a sandbox user's login startup files cannot write to the command's output, create files, or otherwise affect the requested command before it starts. The command still runs under `bash -c`, which reads `BASH_ENV` if it is set in the command's environment. The default (login-shell) behavior is unchanged when the flag is omitted.
 
 ## Set Environment Variables
 
@@ -238,9 +371,9 @@ Inject environment variables into the sandbox at creation time:
 openshell sandbox create --env API_KEY=sk-test --env DEBUG=1 -- my-agent
 ```
 
-Variables set with `--env` are available to all processes in the sandbox, including interactive shells and exec commands.
+Variables set with `--env` are available to all processes in the sandbox, including the initial command, interactive shells, and exec commands.
 
-When an `--env` key looks like a credential — a known provider variable, or a name whose underscore-separated segments include a credential word such as `TOKEN`, `SECRET`, `PASSWORD`, `CREDENTIAL`, `API_KEY`, `ACCESS_KEY`, or `SECRET_KEY` (for example `DB_TOKEN` or `MY_ACCESS_KEY`) — `sandbox create` prints a non-blocking warning. Matching is on whole segments, so unrelated names like `TOKENIZERS_PARALLELISM` or `PASSWORDLESS_LOGIN` do not warn. The agent inside the sandbox can read plain environment values directly, so to hide a secret from the agent, attach it through a [provider](/sandboxes/providers-v2) with `--provider` instead. Suppress the warning with `--no-credential-warnings`. Detection uses the key name only; values are never inspected or printed.
+When an `--env` key looks like a credential — a known provider variable, or a name whose underscore-separated segments include a credential word such as `TOKEN`, `SECRET`, `PASSWORD`, `CREDENTIAL`, `API_KEY`, `ACCESS_KEY`, or `SECRET_KEY` (for example `DB_TOKEN` or `MY_ACCESS_KEY`) — `sandbox create` prints a non-blocking warning. Matching is on whole segments, so unrelated names like `TOKENIZERS_PARALLELISM` or `PASSWORDLESS_LOGIN` do not warn. The agent inside the sandbox can read plain environment values directly, so to hide a secret from the agent, attach it through a [profile-backed provider](/providers/profiles) with `--provider` instead. Suppress the warning with `--no-credential-warnings`. Detection uses the key name only; values are never inspected or printed.
 
 You can also set per-command environment variables with `sandbox exec`:
 
@@ -278,8 +411,30 @@ with SandboxClient.from_active_cluster() as client:
     sandbox = client.create(workspace="default", name="deep-research-1", labels={"env": "dev", "team": "platform"})
     assert sandbox.labels["team"] == "platform"
 
-    matches = client.list(workspace="default", label_selector="env=dev,team=platform")
+    matches = client.list_all(workspace="default", label_selector="env=dev,team=platform")
     assert sandbox.id in {s.id for s in matches}
+```
+
+Python SDK `list` methods return a lazy `Pager` whose iteration yields one
+`Page` per gateway request. Use `list_all` only when you want to exhaust the
+collection; pass `page_token` to resume from a token saved from an earlier page.
+
+Create reusable sandbox templates through the Python SDK when several runs
+should share the same workload shape:
+
+```python
+from openshell import SandboxClient
+
+with SandboxClient.from_active_cluster() as client:
+    templates = client.sandbox_templates()
+
+    templates.create(
+        workspace="default",
+        name="python",
+        image="ghcr.io/nvidia/openshell-community/sandboxes/python:latest",
+    )
+
+    sandbox = client.create_from_template(workspace="default", template_name="python")
 ```
 
 For non-interactive automation, pass a renewable client-credentials provider.
@@ -291,7 +446,7 @@ from openshell import ClientCredentialsAuth, SandboxClient
 
 auth = ClientCredentialsAuth(client_secret=lambda: load_secret())
 with SandboxClient.from_active_cluster(client_credentials=auth) as client:
-    sandboxes = client.list(workspace="default")
+    sandboxes = client.list_all(workspace="default")
 ```
 
 ## Expose Long Running Services
@@ -321,6 +476,18 @@ List endpoints for one sandbox:
 ```shell
 openshell service list my-sandbox
 ```
+
+Use structured output for automation:
+
+```shell
+openshell service list --output json
+openshell service list my-sandbox --output yaml
+```
+
+Structured list output contains `services` and `next_page_token` fields. Each
+record contains `workspace`, `sandbox`, `service`, `target_port`, and `url`.
+The unnamed service uses an empty `service` string. Pass the returned token to
+`--page-token` to continue. An empty result has an empty `services` collection.
 
 Show or delete one endpoint:
 
@@ -361,6 +528,9 @@ openshell sandbox list -o json
 openshell sandbox list -o yaml
 ```
 
+Structured list output contains `sandboxes` and `next_page_token` fields.
+Pass the returned token to `--page-token` to continue.
+
 Get detailed information about a specific sandbox. The output lists **Policy source** (`sandbox` or `global`), **Revision** (the active policy’s row version for that source), and the formatted active policy YAML:
 
 ```shell
@@ -373,11 +543,48 @@ For automation, use `--output json` or `--output yaml` to get machine-readable s
 openshell sandbox get my-sandbox --output json
 ```
 
-Print only that policy YAML for scripting (same effective policy, no metadata):
+Print only the policy YAML for scripting (same effective policy, no metadata):
 
 ```shell
 openshell sandbox get my-sandbox --policy-only
 ```
+
+### Diagnose Failed Calls to Tool Servers
+
+A sandbox can be `Ready` while an agent's call to an external tool server fails with `fetch failed`. Run `openshell sandbox get my-sandbox` and look under `Tool server connections` for the server's address, `Last result`, and `Reported at`. This information is available for configured endpoints that use MCP over HTTP. It helps you find where the call failed without changing sandbox readiness.
+
+JSON and YAML output include an `endpoint_statuses` list with `last_reported_at`. The protobuf API exposes the corresponding timestamp as `Sandbox.status.endpoint_statuses[].last_reported_time`; SDKs render it using their native or curated time representation. Select the endpoint by its address to read the result directly. Treat `endpoint_id` as opaque.
+
+For example, use `jq` to select the tool server at `tools.example.com`, path `/mcp`, and port `443`:
+
+```shell
+openshell sandbox get my-sandbox --output json | jq -e \
+  --arg host tools.example.com --arg path /mcp --argjson ports '[443]' '
+  .endpoint_statuses[]
+  | select(.host == $host and .path == $path and .ports == $ports)
+  '
+```
+
+Read `last_result` to choose the next check:
+
+- `NoObservedExchange`: no result has been reported for the current configuration and supervisor session. Try the operation and inspect its logs if no result appears.
+- `HttpResponseReceived`: the server returned a final HTTP status below 400, including a protocol upgrade. Informational responses alone do not establish success. Check the client's response for protocol or tool errors; an HTTP 200 response can still contain an error.
+- `PolicyDenied`: OpenShell denied the request, including MCP protocol-version or request-body policy checks. Check the sandbox policy and denial logs.
+- `CredentialUnavailable`: required credentials were unavailable. Check the endpoint's attached provider.
+- `TlsFailed`: TLS setup or the handshake failed. Check certificates and TLS configuration.
+- `TransportFailed`: the network exchange failed. Check name resolution, connectivity, and the server process.
+- `UpstreamRejected`: the server returned an HTTP status of 400 or higher. Check the server's response and logs.
+- `Unspecified`: the result is unrecognized or absent. Do not infer success from it.
+
+For example, a stopped server can produce `TransportFailed` while the sandbox stays `Ready`. After the server recovers, an HTTP response below 400 updates the result to `HttpResponseReceived`.
+
+Results come from actual traffic and do not expire. A result can remain unchanged after the server stops until another observed exchange or configuration/session reset. Reports combine recent observations and can drop them when full, so this list is not a request history. The address remains available when a result resets to `NoObservedExchange`. To verify current tool availability, run the actual operation.
+
+`last_reported_at` is the RFC 3339 rendering of the protobuf `last_reported_time` when the gateway accepted the result. It is empty until a result is reported. New accepted observations advance it, including repeated results; identical report retries do not. If a configuration reset supersedes a report whose acknowledgement was lost, the gateway can accept still-valid pending evidence again and advance this timestamp without another exchange.
+
+Addresses use lowercase hosts, canonical paths, and sorted distinct effective ports. Equivalent addresses share one record that combines observations from all callers and ports; it does not establish that every caller or port works. A failure before the HTTP path is known, such as a TLS failure during CONNECT, updates status only when the host and port identify one distinct endpoint. If several configured paths share that host and port, inspect the logs for the failure.
+
+### Inspect Logs and Activity
 
 Stream sandbox logs to monitor agent activity and diagnose policy decisions:
 
@@ -398,7 +605,7 @@ OpenShell Terminal combines sandbox status and live logs in a single real-time d
 openshell term
 ```
 
-Use the terminal to spot blocked connections marked `action=deny` and inference-related proxy activity. If a connection is blocked unexpectedly, add the host to your network policy. Refer to [Policies](/sandboxes/policies) for the workflow.
+Use the terminal to spot blocked connections marked `action=deny` and provider-related proxy activity. If a connection is blocked unexpectedly, add the host to your network policy or update the attached provider profile. Refer to [Policies](/sandboxes/policies) for the workflow.
 
 The dashboard has three panels stacked vertically: Gateways, Providers (or Global Settings), and Sandboxes. Navigate within a panel with `Up`/`Down` or `j`/`k`. At a list boundary the cursor overflows into the adjacent panel, skipping empty panels. Use `Tab`/`Shift+Tab` to cycle panels directly. Press `h`/`l` or `Left`/`Right` in the middle panel to switch between the Providers and Global Settings tabs.
 
@@ -419,6 +626,20 @@ List and stop active forwards:
 openshell forward list
 openshell forward stop 8000 my-sandbox
 ```
+
+Use JSON or YAML output when inspecting tracked forwards from automation:
+
+```shell
+openshell forward list --output json
+openshell forward list --output yaml
+```
+
+Structured output includes `sandbox`, `bind_address`, `port`, `pid`, and
+`alive`. The `alive` boolean reports whether the tracked PID still matches the
+expected OpenShell SSH forward; it does not probe the forwarded socket. When no
+forwards are tracked, structured output returns an empty collection.
+
+The default table colorizes the `STATUS` column only when both standard output and standard error are capable ANSI terminals; piping or redirecting either stream, or running under `TERM=dumb`, gives a plain-text table. Other styled output—including `-v` log lines, progress spinners, prompts, and error messages—is decided per stream, so redirecting one stream leaves the other styled. Prefer `--output json` for automation rather than matching on the table. Set `NO_COLOR` to any non-empty value or pass `--color never` to suppress ANSI formatting, and `--color always` to force it when piping into a pager. `--color` applies to every `openshell` command.
 
 <Tip>
 You can also forward a port at creation time with `--forward`:
@@ -515,9 +736,25 @@ longer need its retained state.
 
 Deleting a sandbox stops all processes, releases resources, and purges injected credentials.
 
+The command can return while cleanup is pending. `deletion accepted` means the
+gateway started deletion; inspect the sandbox until it disappears if your next
+step requires completion. An already-absent sandbox is a successful no-op, but
+missing workspaces and authorization failures remain errors. SDK callers can
+inspect [typed deletion outcomes](/reference/api-errors#deletion-outcomes).
+
 ```shell
 openshell sandbox delete my-sandbox
 ```
+
+Delete multiple sandboxes by listing their names in one command:
+
+```shell
+openshell sandbox delete sandbox-a sandbox-b
+```
+
+When a multi-sandbox delete fails for one entry, the CLI reports that sandbox's
+failure and continues with the remaining names. The command exits with an error
+after it attempts every requested deletion if any entry failed.
 
 ## Sandbox Lifecycle
 

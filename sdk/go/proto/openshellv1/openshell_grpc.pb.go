@@ -27,8 +27,13 @@ const (
 	OpenShell_GetCurrentUser_FullMethodName                = "/openshell.v1.OpenShell/GetCurrentUser"
 	OpenShell_GetGatewayInfo_FullMethodName                = "/openshell.v1.OpenShell/GetGatewayInfo"
 	OpenShell_CreateSandbox_FullMethodName                 = "/openshell.v1.OpenShell/CreateSandbox"
+	OpenShell_BeginRootfsTarStaging_FullMethodName         = "/openshell.v1.OpenShell/BeginRootfsTarStaging"
 	OpenShell_GetSandbox_FullMethodName                    = "/openshell.v1.OpenShell/GetSandbox"
 	OpenShell_ListSandboxes_FullMethodName                 = "/openshell.v1.OpenShell/ListSandboxes"
+	OpenShell_CreateSandboxTemplate_FullMethodName         = "/openshell.v1.OpenShell/CreateSandboxTemplate"
+	OpenShell_GetSandboxTemplate_FullMethodName            = "/openshell.v1.OpenShell/GetSandboxTemplate"
+	OpenShell_ListSandboxTemplates_FullMethodName          = "/openshell.v1.OpenShell/ListSandboxTemplates"
+	OpenShell_DeleteSandboxTemplate_FullMethodName         = "/openshell.v1.OpenShell/DeleteSandboxTemplate"
 	OpenShell_ListSandboxProviders_FullMethodName          = "/openshell.v1.OpenShell/ListSandboxProviders"
 	OpenShell_AttachSandboxProvider_FullMethodName         = "/openshell.v1.OpenShell/AttachSandboxProvider"
 	OpenShell_DetachSandboxProvider_FullMethodName         = "/openshell.v1.OpenShell/DetachSandboxProvider"
@@ -65,6 +70,7 @@ const (
 	OpenShell_GetSandboxPolicyStatus_FullMethodName        = "/openshell.v1.OpenShell/GetSandboxPolicyStatus"
 	OpenShell_ListSandboxPolicies_FullMethodName           = "/openshell.v1.OpenShell/ListSandboxPolicies"
 	OpenShell_ReportPolicyStatus_FullMethodName            = "/openshell.v1.OpenShell/ReportPolicyStatus"
+	OpenShell_ReportEndpointStatus_FullMethodName          = "/openshell.v1.OpenShell/ReportEndpointStatus"
 	OpenShell_GetSandboxProviderEnvironment_FullMethodName = "/openshell.v1.OpenShell/GetSandboxProviderEnvironment"
 	OpenShell_ExchangeProviderSubjectToken_FullMethodName  = "/openshell.v1.OpenShell/ExchangeProviderSubjectToken"
 	OpenShell_GetSandboxLogs_FullMethodName                = "/openshell.v1.OpenShell/GetSandboxLogs"
@@ -115,10 +121,27 @@ type OpenShellClient interface {
 	GetGatewayInfo(ctx context.Context, in *GetGatewayInfoRequest, opts ...grpc.CallOption) (*GetGatewayInfoResponse, error)
 	// Create a new sandbox.
 	CreateSandbox(ctx context.Context, in *CreateSandboxRequest, opts ...grpc.CallOption) (*SandboxResponse, error)
+	// Allocate a gateway-owned staging slot for a local rootfs tar archive.
+	//
+	// The gateway creates a request-scoped directory inside the compute driver's
+	// staging root and returns an opaque single-use token plus the absolute path
+	// the client must write the archive to. The token is then passed as
+	// `template.driver_config.<driver>.rootfs_tar_staging_token` on
+	// CreateSandbox; callers never name a filesystem path themselves. Only a
+	// client sharing the gateway's filesystem can complete the upload.
+	BeginRootfsTarStaging(ctx context.Context, in *BeginRootfsTarStagingRequest, opts ...grpc.CallOption) (*BeginRootfsTarStagingResponse, error)
 	// Fetch a sandbox by name.
 	GetSandbox(ctx context.Context, in *GetSandboxRequest, opts ...grpc.CallOption) (*SandboxResponse, error)
 	// List sandboxes.
 	ListSandboxes(ctx context.Context, in *ListSandboxesRequest, opts ...grpc.CallOption) (*ListSandboxesResponse, error)
+	// Create a reusable sandbox workload template.
+	CreateSandboxTemplate(ctx context.Context, in *CreateSandboxTemplateRequest, opts ...grpc.CallOption) (*SandboxTemplateResponse, error)
+	// Fetch a reusable sandbox workload template by name.
+	GetSandboxTemplate(ctx context.Context, in *GetSandboxTemplateRequest, opts ...grpc.CallOption) (*SandboxTemplateResponse, error)
+	// List reusable sandbox workload templates.
+	ListSandboxTemplates(ctx context.Context, in *ListSandboxTemplatesRequest, opts ...grpc.CallOption) (*ListSandboxTemplatesResponse, error)
+	// Delete a reusable sandbox workload template by name.
+	DeleteSandboxTemplate(ctx context.Context, in *DeleteSandboxTemplateRequest, opts ...grpc.CallOption) (*DeleteSandboxTemplateResponse, error)
 	// List provider records attached to a sandbox.
 	ListSandboxProviders(ctx context.Context, in *ListSandboxProvidersRequest, opts ...grpc.CallOption) (*ListSandboxProvidersResponse, error)
 	// Attach a provider record to an existing sandbox.
@@ -183,9 +206,8 @@ type OpenShellClient interface {
 	DeleteProviderProfile(ctx context.Context, in *DeleteProviderProfileRequest, opts ...grpc.CallOption) (*DeleteProviderProfileResponse, error)
 	// Get sandbox settings by id (called by sandbox entrypoint and poll loop).
 	GetSandboxConfig(ctx context.Context, in *sandboxv1.GetSandboxConfigRequest, opts ...grpc.CallOption) (*sandboxv1.GetSandboxConfigResponse, error)
-	// Get gateway-global settings (read-only feature flags; any authenticated
-	// user may read these so the CLI and TUI can discover capabilities like
-	// providers_v2_enabled without requiring Platform Admin).
+	// Get gateway-global settings (read-only runtime configuration; any
+	// authenticated user may read these without requiring Platform Admin).
 	//
 	// Scope-only (no role): scopes are granted by the IdP at token issuance,
 	// orthogonal to workspace membership. Deployments that enable scope
@@ -200,6 +222,8 @@ type OpenShellClient interface {
 	ListSandboxPolicies(ctx context.Context, in *ListSandboxPoliciesRequest, opts ...grpc.CallOption) (*ListSandboxPoliciesResponse, error)
 	// Report policy load result (called by sandbox after reload attempt).
 	ReportPolicyStatus(ctx context.Context, in *ReportPolicyStatusRequest, opts ...grpc.CallOption) (*ReportPolicyStatusResponse, error)
+	// Replace the gateway's observed tool server endpoint status for one sandbox.
+	ReportEndpointStatus(ctx context.Context, in *ReportEndpointStatusRequest, opts ...grpc.CallOption) (*ReportEndpointStatusResponse, error)
 	// Get provider environment for a sandbox (called by sandbox supervisor at startup).
 	GetSandboxProviderEnvironment(ctx context.Context, in *GetSandboxProviderEnvironmentRequest, opts ...grpc.CallOption) (*GetSandboxProviderEnvironmentResponse, error)
 	// Exchange a stored provider subject token for an intermediate token scoped
@@ -335,6 +359,16 @@ func (c *openShellClient) CreateSandbox(ctx context.Context, in *CreateSandboxRe
 	return out, nil
 }
 
+func (c *openShellClient) BeginRootfsTarStaging(ctx context.Context, in *BeginRootfsTarStagingRequest, opts ...grpc.CallOption) (*BeginRootfsTarStagingResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(BeginRootfsTarStagingResponse)
+	err := c.cc.Invoke(ctx, OpenShell_BeginRootfsTarStaging_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *openShellClient) GetSandbox(ctx context.Context, in *GetSandboxRequest, opts ...grpc.CallOption) (*SandboxResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(SandboxResponse)
@@ -349,6 +383,46 @@ func (c *openShellClient) ListSandboxes(ctx context.Context, in *ListSandboxesRe
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ListSandboxesResponse)
 	err := c.cc.Invoke(ctx, OpenShell_ListSandboxes_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *openShellClient) CreateSandboxTemplate(ctx context.Context, in *CreateSandboxTemplateRequest, opts ...grpc.CallOption) (*SandboxTemplateResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SandboxTemplateResponse)
+	err := c.cc.Invoke(ctx, OpenShell_CreateSandboxTemplate_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *openShellClient) GetSandboxTemplate(ctx context.Context, in *GetSandboxTemplateRequest, opts ...grpc.CallOption) (*SandboxTemplateResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SandboxTemplateResponse)
+	err := c.cc.Invoke(ctx, OpenShell_GetSandboxTemplate_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *openShellClient) ListSandboxTemplates(ctx context.Context, in *ListSandboxTemplatesRequest, opts ...grpc.CallOption) (*ListSandboxTemplatesResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListSandboxTemplatesResponse)
+	err := c.cc.Invoke(ctx, OpenShell_ListSandboxTemplates_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *openShellClient) DeleteSandboxTemplate(ctx context.Context, in *DeleteSandboxTemplateRequest, opts ...grpc.CallOption) (*DeleteSandboxTemplateResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DeleteSandboxTemplateResponse)
+	err := c.cc.Invoke(ctx, OpenShell_DeleteSandboxTemplate_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -730,6 +804,16 @@ func (c *openShellClient) ReportPolicyStatus(ctx context.Context, in *ReportPoli
 	return out, nil
 }
 
+func (c *openShellClient) ReportEndpointStatus(ctx context.Context, in *ReportEndpointStatusRequest, opts ...grpc.CallOption) (*ReportEndpointStatusResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ReportEndpointStatusResponse)
+	err := c.cc.Invoke(ctx, OpenShell_ReportEndpointStatus_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *openShellClient) GetSandboxProviderEnvironment(ctx context.Context, in *GetSandboxProviderEnvironmentRequest, opts ...grpc.CallOption) (*GetSandboxProviderEnvironmentResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(GetSandboxProviderEnvironmentResponse)
@@ -1039,10 +1123,27 @@ type OpenShellServer interface {
 	GetGatewayInfo(context.Context, *GetGatewayInfoRequest) (*GetGatewayInfoResponse, error)
 	// Create a new sandbox.
 	CreateSandbox(context.Context, *CreateSandboxRequest) (*SandboxResponse, error)
+	// Allocate a gateway-owned staging slot for a local rootfs tar archive.
+	//
+	// The gateway creates a request-scoped directory inside the compute driver's
+	// staging root and returns an opaque single-use token plus the absolute path
+	// the client must write the archive to. The token is then passed as
+	// `template.driver_config.<driver>.rootfs_tar_staging_token` on
+	// CreateSandbox; callers never name a filesystem path themselves. Only a
+	// client sharing the gateway's filesystem can complete the upload.
+	BeginRootfsTarStaging(context.Context, *BeginRootfsTarStagingRequest) (*BeginRootfsTarStagingResponse, error)
 	// Fetch a sandbox by name.
 	GetSandbox(context.Context, *GetSandboxRequest) (*SandboxResponse, error)
 	// List sandboxes.
 	ListSandboxes(context.Context, *ListSandboxesRequest) (*ListSandboxesResponse, error)
+	// Create a reusable sandbox workload template.
+	CreateSandboxTemplate(context.Context, *CreateSandboxTemplateRequest) (*SandboxTemplateResponse, error)
+	// Fetch a reusable sandbox workload template by name.
+	GetSandboxTemplate(context.Context, *GetSandboxTemplateRequest) (*SandboxTemplateResponse, error)
+	// List reusable sandbox workload templates.
+	ListSandboxTemplates(context.Context, *ListSandboxTemplatesRequest) (*ListSandboxTemplatesResponse, error)
+	// Delete a reusable sandbox workload template by name.
+	DeleteSandboxTemplate(context.Context, *DeleteSandboxTemplateRequest) (*DeleteSandboxTemplateResponse, error)
 	// List provider records attached to a sandbox.
 	ListSandboxProviders(context.Context, *ListSandboxProvidersRequest) (*ListSandboxProvidersResponse, error)
 	// Attach a provider record to an existing sandbox.
@@ -1107,9 +1208,8 @@ type OpenShellServer interface {
 	DeleteProviderProfile(context.Context, *DeleteProviderProfileRequest) (*DeleteProviderProfileResponse, error)
 	// Get sandbox settings by id (called by sandbox entrypoint and poll loop).
 	GetSandboxConfig(context.Context, *sandboxv1.GetSandboxConfigRequest) (*sandboxv1.GetSandboxConfigResponse, error)
-	// Get gateway-global settings (read-only feature flags; any authenticated
-	// user may read these so the CLI and TUI can discover capabilities like
-	// providers_v2_enabled without requiring Platform Admin).
+	// Get gateway-global settings (read-only runtime configuration; any
+	// authenticated user may read these without requiring Platform Admin).
 	//
 	// Scope-only (no role): scopes are granted by the IdP at token issuance,
 	// orthogonal to workspace membership. Deployments that enable scope
@@ -1124,6 +1224,8 @@ type OpenShellServer interface {
 	ListSandboxPolicies(context.Context, *ListSandboxPoliciesRequest) (*ListSandboxPoliciesResponse, error)
 	// Report policy load result (called by sandbox after reload attempt).
 	ReportPolicyStatus(context.Context, *ReportPolicyStatusRequest) (*ReportPolicyStatusResponse, error)
+	// Replace the gateway's observed tool server endpoint status for one sandbox.
+	ReportEndpointStatus(context.Context, *ReportEndpointStatusRequest) (*ReportEndpointStatusResponse, error)
 	// Get provider environment for a sandbox (called by sandbox supervisor at startup).
 	GetSandboxProviderEnvironment(context.Context, *GetSandboxProviderEnvironmentRequest) (*GetSandboxProviderEnvironmentResponse, error)
 	// Exchange a stored provider subject token for an intermediate token scoped
@@ -1231,11 +1333,26 @@ func (UnimplementedOpenShellServer) GetGatewayInfo(context.Context, *GetGatewayI
 func (UnimplementedOpenShellServer) CreateSandbox(context.Context, *CreateSandboxRequest) (*SandboxResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method CreateSandbox not implemented")
 }
+func (UnimplementedOpenShellServer) BeginRootfsTarStaging(context.Context, *BeginRootfsTarStagingRequest) (*BeginRootfsTarStagingResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method BeginRootfsTarStaging not implemented")
+}
 func (UnimplementedOpenShellServer) GetSandbox(context.Context, *GetSandboxRequest) (*SandboxResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetSandbox not implemented")
 }
 func (UnimplementedOpenShellServer) ListSandboxes(context.Context, *ListSandboxesRequest) (*ListSandboxesResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListSandboxes not implemented")
+}
+func (UnimplementedOpenShellServer) CreateSandboxTemplate(context.Context, *CreateSandboxTemplateRequest) (*SandboxTemplateResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method CreateSandboxTemplate not implemented")
+}
+func (UnimplementedOpenShellServer) GetSandboxTemplate(context.Context, *GetSandboxTemplateRequest) (*SandboxTemplateResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetSandboxTemplate not implemented")
+}
+func (UnimplementedOpenShellServer) ListSandboxTemplates(context.Context, *ListSandboxTemplatesRequest) (*ListSandboxTemplatesResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListSandboxTemplates not implemented")
+}
+func (UnimplementedOpenShellServer) DeleteSandboxTemplate(context.Context, *DeleteSandboxTemplateRequest) (*DeleteSandboxTemplateResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method DeleteSandboxTemplate not implemented")
 }
 func (UnimplementedOpenShellServer) ListSandboxProviders(context.Context, *ListSandboxProvidersRequest) (*ListSandboxProvidersResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListSandboxProviders not implemented")
@@ -1344,6 +1461,9 @@ func (UnimplementedOpenShellServer) ListSandboxPolicies(context.Context, *ListSa
 }
 func (UnimplementedOpenShellServer) ReportPolicyStatus(context.Context, *ReportPolicyStatusRequest) (*ReportPolicyStatusResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ReportPolicyStatus not implemented")
+}
+func (UnimplementedOpenShellServer) ReportEndpointStatus(context.Context, *ReportEndpointStatusRequest) (*ReportEndpointStatusResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ReportEndpointStatus not implemented")
 }
 func (UnimplementedOpenShellServer) GetSandboxProviderEnvironment(context.Context, *GetSandboxProviderEnvironmentRequest) (*GetSandboxProviderEnvironmentResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetSandboxProviderEnvironment not implemented")
@@ -1519,6 +1639,24 @@ func _OpenShell_CreateSandbox_Handler(srv interface{}, ctx context.Context, dec 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _OpenShell_BeginRootfsTarStaging_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(BeginRootfsTarStagingRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OpenShellServer).BeginRootfsTarStaging(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OpenShell_BeginRootfsTarStaging_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OpenShellServer).BeginRootfsTarStaging(ctx, req.(*BeginRootfsTarStagingRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _OpenShell_GetSandbox_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(GetSandboxRequest)
 	if err := dec(in); err != nil {
@@ -1551,6 +1689,78 @@ func _OpenShell_ListSandboxes_Handler(srv interface{}, ctx context.Context, dec 
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(OpenShellServer).ListSandboxes(ctx, req.(*ListSandboxesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _OpenShell_CreateSandboxTemplate_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CreateSandboxTemplateRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OpenShellServer).CreateSandboxTemplate(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OpenShell_CreateSandboxTemplate_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OpenShellServer).CreateSandboxTemplate(ctx, req.(*CreateSandboxTemplateRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _OpenShell_GetSandboxTemplate_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetSandboxTemplateRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OpenShellServer).GetSandboxTemplate(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OpenShell_GetSandboxTemplate_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OpenShellServer).GetSandboxTemplate(ctx, req.(*GetSandboxTemplateRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _OpenShell_ListSandboxTemplates_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListSandboxTemplatesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OpenShellServer).ListSandboxTemplates(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OpenShell_ListSandboxTemplates_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OpenShellServer).ListSandboxTemplates(ctx, req.(*ListSandboxTemplatesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _OpenShell_DeleteSandboxTemplate_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeleteSandboxTemplateRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OpenShellServer).DeleteSandboxTemplate(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OpenShell_DeleteSandboxTemplate_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OpenShellServer).DeleteSandboxTemplate(ctx, req.(*DeleteSandboxTemplateRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -2174,6 +2384,24 @@ func _OpenShell_ReportPolicyStatus_Handler(srv interface{}, ctx context.Context,
 	return interceptor(ctx, in, info, handler)
 }
 
+func _OpenShell_ReportEndpointStatus_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReportEndpointStatusRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OpenShellServer).ReportEndpointStatus(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OpenShell_ReportEndpointStatus_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OpenShellServer).ReportEndpointStatus(ctx, req.(*ReportEndpointStatusRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _OpenShell_GetSandboxProviderEnvironment_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(GetSandboxProviderEnvironmentRequest)
 	if err := dec(in); err != nil {
@@ -2644,12 +2872,32 @@ var OpenShell_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _OpenShell_CreateSandbox_Handler,
 		},
 		{
+			MethodName: "BeginRootfsTarStaging",
+			Handler:    _OpenShell_BeginRootfsTarStaging_Handler,
+		},
+		{
 			MethodName: "GetSandbox",
 			Handler:    _OpenShell_GetSandbox_Handler,
 		},
 		{
 			MethodName: "ListSandboxes",
 			Handler:    _OpenShell_ListSandboxes_Handler,
+		},
+		{
+			MethodName: "CreateSandboxTemplate",
+			Handler:    _OpenShell_CreateSandboxTemplate_Handler,
+		},
+		{
+			MethodName: "GetSandboxTemplate",
+			Handler:    _OpenShell_GetSandboxTemplate_Handler,
+		},
+		{
+			MethodName: "ListSandboxTemplates",
+			Handler:    _OpenShell_ListSandboxTemplates_Handler,
+		},
+		{
+			MethodName: "DeleteSandboxTemplate",
+			Handler:    _OpenShell_DeleteSandboxTemplate_Handler,
 		},
 		{
 			MethodName: "ListSandboxProviders",
@@ -2782,6 +3030,10 @@ var OpenShell_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ReportPolicyStatus",
 			Handler:    _OpenShell_ReportPolicyStatus_Handler,
+		},
+		{
+			MethodName: "ReportEndpointStatus",
+			Handler:    _OpenShell_ReportEndpointStatus_Handler,
 		},
 		{
 			MethodName: "GetSandboxProviderEnvironment",
