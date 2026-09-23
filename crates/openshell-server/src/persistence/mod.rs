@@ -3,10 +3,11 @@
 
 //! Persistence layer for `OpenShell` Server.
 
+mod legacy_time_wire;
 mod postgres;
 mod sqlite;
 
-pub use openshell_core::proto::{
+pub use crate::storage_proto::{
     StoredDraftChunk as DraftChunkRecord, StoredPolicyRevision as PolicyRecord,
 };
 
@@ -26,6 +27,12 @@ pub const DRAFT_CHUNK_OBJECT_TYPE: &str = "draft_policy_chunk";
 
 pub type PersistenceResult<T> = Result<T, PersistenceError>;
 
+/// Maximum number of object ids sent in one set-based delete statement.
+///
+/// Keep this well below `SQLite`'s bind-variable limit. Backends split larger
+/// requests into independently retryable, bounded write statements.
+pub const DELETE_MANY_BATCH_SIZE: usize = 128;
+
 /// Persistence-layer error type.
 #[derive(Debug, Error, Clone)]
 pub enum PersistenceError {
@@ -39,6 +46,8 @@ pub enum PersistenceError {
     Decode(String),
     #[error("encode error: {0}")]
     Encode(String),
+    #[error("pagination error: {0}")]
+    Pagination(String),
     #[error("unique violation{constraint_msg}")]
     UniqueViolation {
         constraint: Option<String>,
@@ -101,6 +110,67 @@ pub struct ObjectRecord {
     pub resource_version: u64,
 }
 
+/// Stable position in the global object-listing order.
+///
+/// Keyset consumers must use the matching store method for the total
+/// `(created_at_ms, name, workspace, id)` order encoded here.
+#[derive(Debug, Clone)]
+pub struct ObjectCursor {
+    pub created_at_ms: i64,
+    pub name: String,
+    pub workspace: String,
+    pub id: String,
+}
+
+impl From<&ObjectRecord> for ObjectCursor {
+    fn from(record: &ObjectRecord) -> Self {
+        Self {
+            created_at_ms: record.created_at_ms,
+            name: record.name.clone(),
+            workspace: record.workspace.clone(),
+            id: record.id.clone(),
+        }
+    }
+}
+
+/// Filters supported by the shared object-store keyset pager.
+#[derive(Debug, Clone, Copy)]
+pub enum ObjectListQuery<'a> {
+    Workspace(&'a str),
+    AllWorkspaces,
+    Scope(&'a str),
+    WorkspaceSelector {
+        workspace: &'a str,
+        label_selector: &'a str,
+    },
+    AllWorkspacesSelector(&'a str),
+    Membership {
+        member_type: &'a str,
+        member_name: &'a str,
+    },
+    MembershipSelector {
+        member_type: &'a str,
+        member_name: &'a str,
+        label_selector: &'a str,
+    },
+}
+
+/// One keyset page of raw object records.
+#[derive(Debug)]
+pub struct ObjectPage {
+    pub records: Vec<ObjectRecord>,
+    pub next_cursor: Option<ObjectCursor>,
+}
+
+/// One keyset page of decoded protobuf messages.
+#[derive(Debug)]
+pub struct MessagePage<T> {
+    pub messages: Vec<T>,
+    pub next_cursor: Option<ObjectCursor>,
+}
+
+const FULL_SCAN_PAGE_SIZE: u32 = 1000;
+
 /// Write condition for compare-and-swap operations.
 #[derive(Debug, Clone, Copy)]
 pub enum WriteCondition {
@@ -132,8 +202,13 @@ pub trait ObjectType {
     fn object_type() -> &'static str;
 }
 
-// Import object metadata accessor traits from openshell-core
-// (implementations for all proto types are in openshell-core::metadata)
+pub fn migrate_legacy_time_fields(object_type: &str, payload: &[u8]) -> PersistenceResult<Vec<u8>> {
+    legacy_time_wire::migrate(object_type, payload)
+}
+
+// Import object metadata accessor traits from openshell-core. Implementations
+// for public resource types live there; private storage types implement them
+// in crate::storage_proto.
 pub use openshell_core::{
     GetResourceVersion, ObjectId, ObjectLabels, ObjectName, ObjectWorkspace, SetResourceVersion,
 };
@@ -157,10 +232,11 @@ pub fn generate_name() -> String {
 /// Extracted to avoid repeating the identical decode-and-hydrate block across
 /// `get_message`, `get_message_by_name`, `list_messages`, and
 /// `list_messages_with_selector`.
-fn decode_record<T: Message + Default + SetResourceVersion>(
+fn decode_record<T: Message + Default + SetResourceVersion + ObjectType>(
     record: ObjectRecord,
 ) -> PersistenceResult<T> {
-    let mut message = T::decode(record.payload.as_slice())
+    let payload = legacy_time_wire::migrate(T::object_type(), &record.payload)?;
+    let mut message = T::decode(payload.as_slice())
         .map_err(|e| PersistenceError::Decode(format!("protobuf decode error: {e}")))?;
     message.set_resource_version(record.resource_version);
     Ok(message)
@@ -371,6 +447,39 @@ impl Store {
         ))
     }
 
+    /// Atomically insert a named object only if its workspace has fewer than
+    /// `max_count` objects of the same type.
+    ///
+    /// Returns `Ok(None)` when the quota is already full. A duplicate id or
+    /// `(object_type, workspace, name)` still returns
+    /// [`PersistenceError::UniqueViolation`].
+    #[allow(clippy::too_many_arguments)]
+    #[tracing::instrument(
+        name = "store",
+        skip_all,
+        fields(otel.name = "store.create_if_workspace_count_below", otel.status_code = tracing::field::Empty, object_type = %object_type, object.id = %id, object.name = %name, workspace = %workspace, max_count = max_count)
+    )]
+    pub async fn create_if_workspace_count_below(
+        &self,
+        object_type: &str,
+        id: &str,
+        name: &str,
+        workspace: &str,
+        payload: &[u8],
+        labels: Option<&str>,
+        max_count: u64,
+    ) -> PersistenceResult<Option<WriteResult>> {
+        store_dispatch_traced!(self.create_if_workspace_count_below(
+            object_type,
+            id,
+            name,
+            workspace,
+            payload,
+            labels,
+            max_count
+        ))
+    }
+
     /// Fetch an object by id.
     #[tracing::instrument(
         name = "store",
@@ -413,6 +522,22 @@ impl Store {
     )]
     pub async fn delete(&self, object_type: &str, id: &str) -> PersistenceResult<bool> {
         store_dispatch_traced!(self.delete(object_type, id))
+    }
+
+    /// Delete objects of one type by id in bounded, set-based statements.
+    #[tracing::instrument(
+        name = "store",
+        skip_all,
+        fields(
+            otel.name = "store.delete_many",
+            otel.status_code = tracing::field::Empty,
+            object_type = %object_type,
+            object_count = ids.len(),
+            batch_count = ids.len().div_ceil(DELETE_MANY_BATCH_SIZE),
+        )
+    )]
+    pub async fn delete_many(&self, object_type: &str, ids: &[String]) -> PersistenceResult<u64> {
+        store_dispatch_traced!(self.delete_many(object_type, ids))
     }
 
     /// Count objects of a given type within a workspace.
@@ -497,6 +622,149 @@ impl Store {
         offset: u32,
     ) -> PersistenceResult<Vec<ObjectRecord>> {
         store_dispatch_traced!(self.list_by_type(object_type, limit, offset))
+    }
+
+    /// List workspace objects after a stable cursor, without offset drift.
+    #[tracing::instrument(
+        name = "store",
+        skip_all,
+        fields(
+            otel.name = "store.list_after",
+            otel.status_code = tracing::field::Empty,
+            object_type = %object_type,
+            workspace = %workspace,
+        )
+    )]
+    pub async fn list_after(
+        &self,
+        object_type: &str,
+        workspace: &str,
+        after: Option<&ObjectCursor>,
+        limit: u32,
+    ) -> PersistenceResult<Vec<ObjectRecord>> {
+        store_dispatch_traced!(self.list_after(object_type, workspace, after, limit))
+    }
+
+    /// List objects across workspaces after a stable cursor, without offset drift.
+    #[tracing::instrument(
+        name = "store",
+        skip_all,
+        fields(
+            otel.name = "store.list_by_type_after",
+            otel.status_code = tracing::field::Empty,
+            object_type = %object_type,
+        )
+    )]
+    pub async fn list_by_type_after(
+        &self,
+        object_type: &str,
+        after: Option<&ObjectCursor>,
+        limit: u32,
+    ) -> PersistenceResult<Vec<ObjectRecord>> {
+        store_dispatch_traced!(self.list_by_type_after(object_type, after, limit))
+    }
+
+    /// Return one keyset page for an explicit query shape.
+    ///
+    /// The page is ordered by the immutable total key
+    /// `(created_at_ms, name, workspace, id)`. `next_cursor` is present only
+    /// when another page exists.
+    pub async fn list_object_page(
+        &self,
+        object_type: &str,
+        query: ObjectListQuery<'_>,
+        after: Option<&ObjectCursor>,
+        page_size: u32,
+    ) -> PersistenceResult<ObjectPage> {
+        if page_size == 0 {
+            return Err(PersistenceError::Pagination(
+                "page size must be greater than zero".into(),
+            ));
+        }
+        let fetch_size = page_size.checked_add(1).ok_or_else(|| {
+            PersistenceError::Pagination("page size overflow while probing next page".into())
+        })?;
+        let mut records = match self {
+            Self::Postgres(store) => {
+                store
+                    .list_object_page(object_type, query, after, fetch_size)
+                    .await
+            }
+            Self::Sqlite(store) => {
+                store
+                    .list_object_page(object_type, query, after, fetch_size)
+                    .await
+            }
+        }?;
+        let has_more = records.len()
+            > usize::try_from(page_size)
+                .map_err(|_| PersistenceError::Pagination("page size does not fit usize".into()))?;
+        if has_more {
+            records.truncate(usize::try_from(page_size).map_err(|_| {
+                PersistenceError::Pagination("page size does not fit usize".into())
+            })?);
+        }
+        let next_cursor = if has_more {
+            records.last().map(ObjectCursor::from)
+        } else {
+            None
+        };
+        Ok(ObjectPage {
+            records,
+            next_cursor,
+        })
+    }
+
+    /// Return one decoded keyset page and hydrate every resource version.
+    pub async fn list_message_page<T: Message + Default + ObjectType + SetResourceVersion>(
+        &self,
+        query: ObjectListQuery<'_>,
+        after: Option<&ObjectCursor>,
+        page_size: u32,
+    ) -> PersistenceResult<MessagePage<T>> {
+        let page = self
+            .list_object_page(T::object_type(), query, after, page_size)
+            .await?;
+        Ok(MessagePage {
+            messages: page
+                .records
+                .into_iter()
+                .map(decode_record)
+                .collect::<PersistenceResult<Vec<T>>>()?,
+            next_cursor: page.next_cursor,
+        })
+    }
+
+    /// Exhaust every keyset page and return all matching raw records.
+    pub async fn collect_records(
+        &self,
+        object_type: &str,
+        query: ObjectListQuery<'_>,
+    ) -> PersistenceResult<Vec<ObjectRecord>> {
+        let mut records = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = self
+                .list_object_page(object_type, query, cursor.as_ref(), FULL_SCAN_PAGE_SIZE)
+                .await?;
+            records.extend(page.records);
+            let Some(next_cursor) = page.next_cursor else {
+                return Ok(records);
+            };
+            cursor = Some(next_cursor);
+        }
+    }
+
+    /// Exhaust every keyset page and return all matching decoded messages.
+    ///
+    /// Database and protobuf decode failures abort the operation; no partial
+    /// result is returned.
+    pub async fn collect_messages<T: Message + Default + ObjectType + SetResourceVersion>(
+        &self,
+        query: ObjectListQuery<'_>,
+    ) -> PersistenceResult<Vec<T>> {
+        let records = self.collect_records(T::object_type(), query).await?;
+        records.into_iter().map(decode_record).collect()
     }
 
     /// List objects by type and application-owned scope.

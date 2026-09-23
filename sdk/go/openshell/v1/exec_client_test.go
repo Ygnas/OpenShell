@@ -37,10 +37,13 @@ func (r *stubSandboxResolver) Get(_ context.Context, _, name string) (*Sandbox, 
 func (r *stubSandboxResolver) Create(context.Context, string, string, *SandboxSpec, map[string]string, ...CreateOptions) (*Sandbox, error) {
 	panic("not implemented")
 }
-func (r *stubSandboxResolver) List(context.Context, string, ...ListOptions) ([]*Sandbox, error) {
+func (r *stubSandboxResolver) List(string, ...ListOptions) (*Pager[*Sandbox], error) {
 	panic("not implemented")
 }
-func (r *stubSandboxResolver) Delete(context.Context, string, string) error {
+func (r *stubSandboxResolver) ListAll(context.Context, string, ...ListOptions) ([]*Sandbox, error) {
+	panic("not implemented")
+}
+func (r *stubSandboxResolver) Delete(context.Context, string, string, ...DeleteOptions) (*DeletionResult, error) {
 	panic("not implemented")
 }
 func (r *stubSandboxResolver) AttachProvider(context.Context, string, string, string, uint64) (*AttachProviderResult, error) {

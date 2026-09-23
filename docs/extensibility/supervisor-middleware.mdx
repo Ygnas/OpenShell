@@ -22,12 +22,14 @@ For each inspected HTTP request, the supervisor:
 5. Re-checks body-aware protocol policy (GraphQL, JSON-RPC, MCP) after each stage that replaces the body. Every middleware receives a payload the policy admits, and a transformation cannot smuggle a denied or unparseable operation to a later stage or the upstream.
 6. Applies allowed transformations, injects provider credentials, and forwards the request.
 
+Response middleware advertising `HTTP_RESPONSE/PRE_RETURN` inspects the final upstream response before OpenShell returns it to the workload. Its preflight includes upstream `Content-Length`, `Content-Encoding`, and `Content-Range` fields as read-only metadata, except when `Connection` nominates the field as hop-by-hop. Middleware cannot write or remove these fields. OpenShell computes downstream framing separately and emits the final `Content-Length` or `Transfer-Encoding` exactly once after middleware processing.
+
 For an RFC 6455 upgrade over `ws://` or `wss://`, the supervisor first finds every host-matched attachment, then selects only implementations that advertise `WEBSOCKET_MESSAGE/PRE_CREDENTIALS`. It opens one ordered, phase-specific `EvaluateWebSocketSession` stream per selected stage. OpenShell sends `WebSocketSessionEvent` values, while the service returns `WebSocketSessionEventResult` values only for preflight and message events; session start and end are notifications. Future upstream-to-client inspection uses the same RPC with `PRE_RETURN`; an implementation that advertises both phases receives two independent streams for the WebSocket session. An attachment without the selected binding can still inspect the HTTP upgrade request when it advertises the HTTP binding, but it is not a failed WebSocket stage. OpenShell allows post-upgrade traffic and emits an informational `binding_not_selected` coverage event for that attachment.
 
 1. A preflight before the upgrade is sent upstream. The stage chooses `INSPECT`, voluntary `SKIP`, or authoritative `DENY` and may return a bounded diagnostic reason, stable reason code, findings, and metadata. OpenShell runs selected preflights concurrently; any `DENY` rejects the upgrade regardless of `on_error`.
 2. A session-start event after the upstream accepts the upgrade, including the negotiated subprotocol.
 3. Complete client-to-upstream text messages in sequence order. OpenShell reassembles fragmented messages and decompresses negotiated `permessage-deflate` messages before evaluation.
-4. A best-effort session-end event when the stage stream remains writable. OpenShell attempts at most one terminal event for each opened stream, including streams opened during a preflight that rejects the upgrade before session start.
+4. A best-effort session-end event when the stage stream remains writable. OpenShell attempts at most one terminal event for each opened stream, including streams opened during a preflight that rejects the upgrade before session start. It then half-closes the request stream and briefly drains the response stream so the terminal event can leave the local transport before the RPC closes. Middleware services should finish their response stream after the request stream reaches EOF.
 
 The protobuf represents each logical message with a `text` or `binary` payload variant. Text uses the protobuf `string` type, so invalid UTF-8 cannot enter the middleware contract. Results use an optional matching replacement variant: absence preserves the input, while presence represents a replacement even when its content is empty. OpenShell rejects attempts to change the message type. Allowed replacements are re-framed, re-compressed when required, and forwarded. Binary messages, control frames, and upstream-to-client traffic remain uninspected. Binary messages pass through under both `on_error` modes. For each active selected stage, OpenShell emits an informational `unsupported_message_type` coverage event and advances the session-global sequence; the next text message can therefore reach the stage with a valid sequence gap.
 
@@ -144,6 +146,8 @@ See [Policy Schema](/reference/policy-schema#network-middleware) for the complet
 | `fail_closed` | Denies the HTTP request or closes the WebSocket when the stage fails. This is the default. |
 | `fail_open` | Skips the failed HTTP stage. For a broken WebSocket stage stream, disables that stage for the rest of the connection and continues the remaining chain. |
 
+A valid upstream response can exceed the middleware envelope limits or contain header bytes that the middleware protocol cannot represent. OpenShell relays the original response when every selected response stage uses `fail_open`; any selected `fail_closed` stage causes the canonical 502 delivery failure. Malformed or unsafe HTTP does not qualify for this bypass.
+
 Use `fail_open` only when bypassing the middleware preserves the intended security policy. OpenShell emits a detection finding when a failed stage is bypassed and a separate state-change finding when a WebSocket stage is disabled for the session.
 
 Capability coverage is separate from failure handling. A host-matched HTTP-only attachment does not join the WebSocket chain, regardless of `on_error`. Binary messages are outside the V1 text-message binding and pass through even when a selected stage is `fail_closed`. OpenShell records both states as informational coverage events so operators do not mistake pass-through traffic for inspected traffic. If a deployment requires all WebSocket message classes to be inspected, V1 cannot express that requirement.
@@ -189,7 +193,7 @@ A middleware result can return ordered header mutations before OpenShell injects
 
 A `remove` mutation removes every value for a case-insensitive header name. OpenShell applies each successful stage's mutations before invoking the next middleware, so later stages observe the accumulated header state.
 
-Header writes must use the `x-openshell-middleware-` prefix. Removes may target other middleware-visible request headers. Protected credential, routing, framing, and hop-by-hop headers are always rejected. Header values must not contain control characters.
+Writes and removals may target middleware-visible end-to-end request headers. Protected credential, routing, framing, and hop-by-hop headers are always rejected. Header values must not contain control characters or OpenShell credential placeholder syntax. Middleware runs before credential injection, but it cannot introduce a value that the later injection step would resolve.
 
 OpenShell validates and applies each stage's mutations atomically. An invalid operation discards every mutation from that stage and follows its `on_error` behavior. Built-in failures can name the offending header. Operator-run failures use a platform-owned error code so request-derived header text cannot reach logs or denied responses.
 
@@ -220,10 +224,16 @@ Middleware activity is emitted through OpenShell's OCSF logging:
 
 See [Logging](/observability/logging) for log access and [OCSF JSON Export](/observability/ocsf-json-export) for structured export.
 
+## Runnable example
+
+The [content guard example](https://github.com/NVIDIA/OpenShell/tree/main/examples/supervisor-middleware-content-guard) matches configured literal terms in UTF-8 request bodies, complete response bodies, and client WebSocket text messages. It supports redaction and denial. Responses require whole-body inspection; unavailable inspection or invalid UTF-8 invokes the configured `on_error` policy. It is not a general PII detector.
+
+The example includes a policy, local fixture, and smoke launcher.
+
 ## Current Limitations
 
 - Middleware applies only through operation bindings advertised by each implementation. For protocols that have no supported middleware operation at all, such as HTTP/2 prior knowledge or non-HTTP TCP, the existing uninspectable-traffic gate denies a host match containing `fail_closed` and relays an all-`fail_open` match with a detection finding.
-- The typed operation and phase pairs are `HTTP_REQUEST/PRE_CREDENTIALS` and `WEBSOCKET_MESSAGE/PRE_CREDENTIALS`.
+- The typed operation and phase pairs are `HTTP_REQUEST/PRE_CREDENTIALS`, `HTTP_RESPONSE/PRE_RETURN`, and `WEBSOCKET_MESSAGE/PRE_CREDENTIALS`.
 - A host match does not imply every advertised operation: an HTTP-only attachment can inspect the upgrade GET, then post-upgrade traffic passes with `binding_not_selected` coverage.
 - The V1 WebSocket binding inspects complete client text messages only. Binary messages pass with `unsupported_message_type` coverage for active stages; control frames and upstream-to-client messages remain outside the middleware operation.
 - Selection uses destination host include and exclude patterns.

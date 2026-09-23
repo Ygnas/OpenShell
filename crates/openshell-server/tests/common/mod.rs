@@ -30,7 +30,7 @@ use openshell_core::proto::{
     open_shell_server::{OpenShell, OpenShellServer},
 };
 use openshell_server::{MultiplexedService, Store, TlsAcceptor, health_router};
-use rcgen::{CertificateParams, IsCa, KeyPair};
+use rcgen::{CertificateParams, IsCa};
 use rustls::RootCertStore;
 use rustls::pki_types::CertificateDer;
 use rustls_pemfile::certs;
@@ -53,6 +53,22 @@ pub struct TestOpenShell;
 
 #[tonic::async_trait]
 impl OpenShell for TestOpenShell {
+    async fn report_endpoint_status(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ReportEndpointStatusRequest>,
+    ) -> Result<Response<openshell_core::proto::ReportEndpointStatusResponse>, Status> {
+        Ok(Response::new(
+            openshell_core::proto::ReportEndpointStatusResponse {},
+        ))
+    }
+
+    async fn begin_rootfs_tar_staging(
+        &self,
+        _request: tonic::Request<openshell_core::proto::BeginRootfsTarStagingRequest>,
+    ) -> Result<Response<openshell_core::proto::BeginRootfsTarStagingResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
     async fn report_main_process_exit(
         &self,
         _request: tonic::Request<openshell_core::proto::ReportMainProcessExitRequest>,
@@ -96,6 +112,34 @@ impl OpenShell for TestOpenShell {
         _request: tonic::Request<CreateSandboxRequest>,
     ) -> Result<Response<SandboxResponse>, Status> {
         Ok(Response::new(SandboxResponse::default()))
+    }
+
+    async fn create_sandbox_template(
+        &self,
+        _request: tonic::Request<openshell_core::proto::CreateSandboxTemplateRequest>,
+    ) -> Result<Response<openshell_core::proto::SandboxTemplateResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn get_sandbox_template(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetSandboxTemplateRequest>,
+    ) -> Result<Response<openshell_core::proto::SandboxTemplateResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn list_sandbox_templates(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ListSandboxTemplatesRequest>,
+    ) -> Result<Response<openshell_core::proto::ListSandboxTemplatesResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn delete_sandbox_template(
+        &self,
+        _request: tonic::Request<openshell_core::proto::DeleteSandboxTemplateRequest>,
+    ) -> Result<Response<openshell_core::proto::DeleteSandboxTemplateResponse>, Status> {
+        Err(Status::unimplemented("unused"))
     }
 
     async fn stop_sandbox(
@@ -157,7 +201,10 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<DeleteSandboxRequest>,
     ) -> Result<Response<DeleteSandboxResponse>, Status> {
-        Ok(Response::new(DeleteSandboxResponse { deleted: true }))
+        Ok(Response::new(DeleteSandboxResponse {
+            sandbox_id: String::new(),
+            outcome: openshell_core::proto::DeletionOutcome::Completed.into(),
+        }))
     }
 
     async fn get_sandbox_config(
@@ -172,6 +219,22 @@ impl OpenShell for TestOpenShell {
         _request: tonic::Request<GetGatewayConfigRequest>,
     ) -> Result<Response<GetGatewayConfigResponse>, Status> {
         Ok(Response::new(GetGatewayConfigResponse::default()))
+    }
+
+    async fn get_sandbox_provider_status(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetSandboxProviderStatusRequest>,
+    ) -> Result<Response<openshell_core::proto::GetSandboxProviderStatusResponse>, Status> {
+        Err(Status::unimplemented(
+            "provider readiness is not exercised by this mock",
+        ))
+    }
+
+    async fn report_provider_readiness(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ReportProviderReadinessRequest>,
+    ) -> Result<Response<openshell_core::proto::ReportProviderReadinessResponse>, Status> {
+        Err(Status::unimplemented("provider readiness"))
     }
 
     async fn get_sandbox_provider_environment(
@@ -400,6 +463,13 @@ impl OpenShell for TestOpenShell {
         Err(Status::unimplemented("not implemented in test"))
     }
 
+    async fn report_sandbox_configuration(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ReportSandboxConfigurationRequest>,
+    ) -> Result<Response<openshell_core::proto::ReportSandboxConfigurationResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
     async fn report_policy_status(
         &self,
         _request: tonic::Request<openshell_core::proto::ReportPolicyStatusRequest>,
@@ -578,11 +648,6 @@ impl OpenShell for TestOpenShell {
 // TLS / PKI helpers (used by TLS integration tests)
 // ---------------------------------------------------------------------------
 
-/// Initialise the rustls crypto provider (idempotent).
-pub fn install_rustls_provider() {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-}
-
 /// PKI bundle: CA cert, server cert+key, client cert+key (all PEM).
 #[allow(clippy::struct_field_names)]
 pub struct PkiBundle {
@@ -603,18 +668,18 @@ pub fn generate_pki() -> (tempfile::TempDir, PkiBundle) {
     ca_params
         .distinguished_name
         .push(rcgen::DnType::CommonName, "test-ca");
-    let ca_key = KeyPair::generate().expect("failed to generate CA key");
-    let ca_cert = ca_params
-        .self_signed(&ca_key)
-        .expect("failed to sign CA cert");
+    let ca_key = openshell_crypto::pki::generate_keypair().expect("failed to generate CA key");
+    let ca_cert =
+        openshell_crypto::pki::self_signed(ca_params, &ca_key).expect("failed to sign CA cert");
 
     // Generate server cert signed by CA
     let server_params = CertificateParams::new(vec!["localhost".to_string()])
         .expect("failed to create server params");
-    let server_key = KeyPair::generate().expect("failed to generate server key");
-    let server_cert = server_params
-        .signed_by(&server_key, &ca_cert, &ca_key)
-        .expect("failed to sign server cert");
+    let server_key =
+        openshell_crypto::pki::generate_keypair().expect("failed to generate server key");
+    let server_cert =
+        openshell_crypto::pki::signed_by(server_params, &server_key, &ca_cert, &ca_key)
+            .expect("failed to sign server cert");
 
     // Generate client cert signed by CA
     let mut client_params =
@@ -622,10 +687,11 @@ pub fn generate_pki() -> (tempfile::TempDir, PkiBundle) {
     client_params
         .distinguished_name
         .push(rcgen::DnType::CommonName, "test-client");
-    let client_key = KeyPair::generate().expect("failed to generate client key");
-    let client_cert = client_params
-        .signed_by(&client_key, &ca_cert, &ca_key)
-        .expect("failed to sign client cert");
+    let client_key =
+        openshell_crypto::pki::generate_keypair().expect("failed to generate client key");
+    let client_cert =
+        openshell_crypto::pki::signed_by(client_params, &client_key, &ca_cert, &ca_key)
+            .expect("failed to sign client cert");
 
     let dir = tempdir().expect("failed to create tempdir");
     let write_file = |name: &str, data: &[u8]| {
@@ -637,16 +703,22 @@ pub fn generate_pki() -> (tempfile::TempDir, PkiBundle) {
 
     write_file("ca.pem", ca_cert.pem().as_bytes());
     write_file("server-cert.pem", server_cert.pem().as_bytes());
-    write_file("server-key.pem", server_key.serialize_pem().as_bytes());
+    write_file(
+        "server-key.pem",
+        server_key.serialize_pem().unwrap().as_bytes(),
+    );
     write_file("client-cert.pem", client_cert.pem().as_bytes());
-    write_file("client-key.pem", client_key.serialize_pem().as_bytes());
+    write_file(
+        "client-key.pem",
+        client_key.serialize_pem().unwrap().as_bytes(),
+    );
 
     let bundle = PkiBundle {
         ca_cert_pem: ca_cert.pem().into_bytes(),
         server_cert_pem: server_cert.pem().into_bytes(),
-        server_key_pem: server_key.serialize_pem().into_bytes(),
+        server_key_pem: server_key.serialize_pem().unwrap().into_bytes(),
         client_cert_pem: client_cert.pem().into_bytes(),
-        client_key_pem: client_key.serialize_pem().into_bytes(),
+        client_key_pem: client_key.serialize_pem().unwrap().into_bytes(),
     };
 
     (dir, bundle)
@@ -701,9 +773,9 @@ pub fn generate_rogue_pki() -> RoguePkiBundle {
     rogue_ca_params
         .distinguished_name
         .push(rcgen::DnType::CommonName, "rogue-ca");
-    let rogue_ca_key = KeyPair::generate().expect("failed to generate rogue CA key");
-    let rogue_ca_cert = rogue_ca_params
-        .self_signed(&rogue_ca_key)
+    let rogue_ca_key =
+        openshell_crypto::pki::generate_keypair().expect("failed to generate rogue CA key");
+    let rogue_ca_cert = openshell_crypto::pki::self_signed(rogue_ca_params, &rogue_ca_key)
         .expect("failed to sign rogue CA cert");
 
     let mut rogue_client_params =
@@ -711,14 +783,19 @@ pub fn generate_rogue_pki() -> RoguePkiBundle {
     rogue_client_params
         .distinguished_name
         .push(rcgen::DnType::CommonName, "rogue-client");
-    let rogue_client_key = KeyPair::generate().expect("failed to generate rogue client key");
-    let rogue_client_cert = rogue_client_params
-        .signed_by(&rogue_client_key, &rogue_ca_cert, &rogue_ca_key)
-        .expect("failed to sign rogue client cert");
+    let rogue_client_key =
+        openshell_crypto::pki::generate_keypair().expect("failed to generate rogue client key");
+    let rogue_client_cert = openshell_crypto::pki::signed_by(
+        rogue_client_params,
+        &rogue_client_key,
+        &rogue_ca_cert,
+        &rogue_ca_key,
+    )
+    .expect("failed to sign rogue client cert");
 
     RoguePkiBundle {
         client_cert_pem: rogue_client_cert.pem(),
-        client_key_pem: rogue_client_key.serialize_pem(),
+        client_key_pem: rogue_client_key.serialize_pem().unwrap(),
     }
 }
 

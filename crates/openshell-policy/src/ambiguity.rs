@@ -181,12 +181,6 @@ fn connection_conflicts(left: &NetworkEndpoint, right: &NetworkEndpoint) -> Vec<
         &normalized_strings(&left.allowed_ips),
         &normalized_strings(&right.allowed_ips),
     );
-    push_conflict(
-        &mut conflicts,
-        "advisor_proposed",
-        &left.advisor_proposed,
-        &right.advisor_proposed,
-    );
     conflicts
 }
 
@@ -732,7 +726,6 @@ mod tests {
                 endpoints: vec![left],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/curl".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -743,7 +736,6 @@ mod tests {
                 endpoints: vec![right],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/bash".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -785,6 +777,15 @@ mod tests {
         right.access = "read-write".to_string();
 
         assert!(find_endpoint_ambiguities(&policy_with(left, right)).is_empty());
+    }
+
+    #[test]
+    fn advisor_provenance_does_not_make_endpoints_ambiguous() {
+        let explicit = endpoint("api.example.com", 443);
+        let mut proposed = explicit.clone();
+        proposed.advisor_proposed = true;
+
+        assert!(find_endpoint_ambiguities(&policy_with(explicit, proposed)).is_empty());
     }
 
     #[test]

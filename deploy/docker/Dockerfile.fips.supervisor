@@ -1,0 +1,48 @@
+# syntax=docker/dockerfile:1.4
+
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Standalone FIPS-readiness supervisor image. This path is intentionally
+# separate from the normal Distroless image.
+
+FROM registry.access.redhat.com/ubi9/ubi:9.8 AS builder
+
+RUN dnf install -y --nodocs --setopt=install_weak_deps=0 \
+        gcc gcc-c++ make cmake openssl-devel pkg-config tar xz \
+    && dnf clean all
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --default-toolchain 1.95.0 --profile minimal
+
+ENV PATH=/root/.cargo/bin:${PATH}
+ENV CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
+
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY .cargo/ .cargo/
+COPY crates/ crates/
+COPY proto/ proto/
+COPY providers/ providers/
+
+# The ordinary workspace remains AWS-LC. This image is the explicit OpenSSL
+# build path used only by the FIPS-readiness workflow.
+RUN sed -i 's/features = \["aws-lc"\]/features = ["openssl"]/g' Cargo.toml \
+    && cargo build --release \
+        --package openshell-supervisor \
+        --bin openshell-supervisor \
+        --no-default-features \
+        --features defaults-without-telemetry
+
+FROM registry.access.redhat.com/ubi9/ubi-minimal:9.8
+
+RUN microdnf install -y --nodocs --setopt=install_weak_deps=0 \
+        ca-certificates crypto-policies-scripts openssl-libs \
+    && microdnf clean all \
+    && update-crypto-policies --set DEFAULT:PQ
+
+COPY --from=builder --chmod=0555 \
+    /build/target/release/openshell-supervisor \
+    /openshell-supervisor
+
+ENTRYPOINT ["/openshell-supervisor"]

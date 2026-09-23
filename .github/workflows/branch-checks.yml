@@ -41,6 +41,7 @@ jobs:
     needs: pr_metadata
     if: needs.pr_metadata.outputs.should_run == 'true'
     runs-on: linux-amd64-cpu8
+    timeout-minutes: 30
     container:
       image: ghcr.io/nvidia/openshell/ci:latest
       credentials:
@@ -65,6 +66,7 @@ jobs:
     needs: pr_metadata
     if: needs.pr_metadata.outputs.should_run == 'true'
     runs-on: linux-amd64-cpu8
+    timeout-minutes: 30
     container:
       image: ghcr.io/nvidia/openshell/ci:latest
       credentials:
@@ -84,6 +86,7 @@ jobs:
     needs: pr_metadata
     if: needs.pr_metadata.outputs.should_run == 'true'
     runs-on: linux-amd64-cpu8
+    timeout-minutes: 30
     defaults:
       run:
         shell: nix develop .#devShells.x86_64-linux.default -c bash -euo pipefail {0}
@@ -117,6 +120,7 @@ jobs:
           - runner: macos-15-xlarge
             system: aarch64-darwin
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
     defaults:
       run:
         shell: nix develop .#devShells.${{ matrix.system }}.default -c bash -euo pipefail {0}
@@ -154,18 +158,79 @@ jobs:
           cargo fmt --all -- --check
           cargo fmt --manifest-path e2e/rust/Cargo.toml --all -- --check
           cargo fmt --manifest-path examples/governance-interceptor/Cargo.toml --all -- --check
+          cargo fmt --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml --all -- --check
 
       - name: Lint
         run: |
           cargo clippy --workspace --all-targets -- -D warnings
           cargo clippy --manifest-path e2e/rust/Cargo.toml --all-targets -- -D warnings
-          cargo check --manifest-path examples/governance-interceptor/Cargo.toml --all-targets
+          cargo clippy --manifest-path examples/governance-interceptor/Cargo.toml --all-targets -- -D warnings
+          cargo clippy --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml --all-targets -- -D warnings
 
       - name: Test
         env:
           OPENSHELL_TELEMETRY_ENABLED: "false"
         run: |
           cargo nextest run --profile ci --workspace --features openshell-server/test-support
+          cargo nextest run --config-file .config/nextest.toml --profile ci --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml
+
+      - name: Verify standalone policy prover package
+        if: matrix.system == 'x86_64-linux'
+        env:
+          CARGO_NET_OFFLINE: "true"
+        run: |
+          cargo test --locked -p openshell-prover-cli
+          cargo build --locked --release -p openshell-prover-cli --bin openshell-prover
+          cargo tree --locked -p openshell-prover-cli --edges normal --prefix none > /tmp/openshell-prover-dependencies.txt
+          if grep -Eq '^(openshell-(cli|server|sdk|bootstrap|tui|providers|core|policy)) v' /tmp/openshell-prover-dependencies.txt; then
+            echo "ERROR: standalone prover includes an OpenShell control-plane dependency" >&2
+            cat /tmp/openshell-prover-dependencies.txt >&2
+            exit 1
+          fi
+          target/release/openshell-prover check \
+            crates/openshell-prover-cli/tests/fixtures/candidate-contained.yaml \
+            --boundary crates/openshell-prover-cli/tests/fixtures/boundary.yaml \
+            --output json > /tmp/openshell-prover-result.json
+          grep -q '"result"[[:space:]]*:[[:space:]]*"within_boundary"' /tmp/openshell-prover-result.json
+
+      - name: Verify telemetry can be compiled out
+        run: |
+          cargo build -p openshell-gateway --bin openshell-gateway
+          tasks/scripts/verify-telemetry-compiled-out.sh present target/debug/openshell-gateway
+          cargo build -p openshell-gateway --bin openshell-gateway --no-default-features --features defaults-without-telemetry
+          tasks/scripts/verify-telemetry-compiled-out.sh absent target/debug/openshell-gateway
+          cargo build -p openshell-supervisor --bin openshell-supervisor --no-default-features --features defaults-without-telemetry
+          tasks/scripts/verify-telemetry-compiled-out.sh absent target/debug/openshell-supervisor
+
+      - name: Verify selective gateway compute-driver builds
+        run: |
+          cargo test -p openshell-gateway --all-targets --no-default-features
+          cargo test -p openshell-gateway --all-targets --no-default-features --features compute-driver-docker
+          cargo test -p openshell-gateway --all-targets --no-default-features --features compute-driver-kubernetes
+          cargo test -p openshell-gateway --all-targets --no-default-features --features compute-driver-podman
+          cargo test -p openshell-gateway --all-targets --no-default-features --features compute-driver-vm
+          cargo test -p openshell-gateway --all-targets --no-default-features --features compute-driver-mxc
+          cargo test -p openshell-gateway --all-targets --no-default-features --features compute-driver-docker,compute-driver-vm
+
+      - name: Verify the defaults-without-telemetry feature alias tracks the default feature set
+        run: tasks/scripts/verify-defaults-without-telemetry.sh
+
+      - name: Verify system CA roots build mode compiles and excludes bundled Mozilla roots
+        run: |
+          cargo check -p openshell-supervisor --all-targets --no-default-features --features system-ca-roots
+          if cargo tree -p openshell-supervisor -i webpki-roots --no-default-features --features system-ca-roots 2>/dev/null | grep -q webpki-roots; then
+            echo "ERROR: webpki-roots found in system CA roots build" >&2
+            exit 1
+          fi
+          if cargo tree -p openshell-supervisor -i webpki-root-certs --no-default-features --features system-ca-roots 2>/dev/null | grep -q webpki-root-certs; then
+            echo "ERROR: webpki-root-certs found in system CA roots build" >&2
+            exit 1
+          fi
+
+      - name: Verify Cargo lockfiles unchanged
+        run: |
+          tasks/scripts/check-cargo-lockfiles.sh
+          git diff --exit-code HEAD -- ':(glob)**/Cargo.lock'
 
   python:
     name: Python (${{ matrix.runner }})
@@ -176,6 +241,7 @@ jobs:
       matrix:
         runner: [linux-amd64-cpu8, linux-arm64-cpu8]
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
     container:
       image: ghcr.io/nvidia/openshell/ci:latest
       credentials:
@@ -202,11 +268,16 @@ jobs:
       - name: Test
         run: mise run test:python
 
+      - name: Test local gateway configuration helpers
+        run: |
+          bash tasks/scripts/test-gateway-pull-policy.sh
+          bash tasks/scripts/test-gateway-config.sh
   go:
     name: Go SDK
     needs: pr_metadata
     if: needs.pr_metadata.outputs.should_run == 'true'
     runs-on: linux-amd64-cpu8
+    timeout-minutes: 30
     container:
       image: ghcr.io/nvidia/openshell/ci:latest
       credentials:
@@ -226,6 +297,7 @@ jobs:
     needs: pr_metadata
     if: needs.pr_metadata.outputs.should_run == 'true'
     runs-on: linux-amd64-cpu8
+    timeout-minutes: 30
     container:
       image: ghcr.io/nvidia/openshell/ci:latest
       credentials:
@@ -245,6 +317,7 @@ jobs:
     needs: pr_metadata
     if: needs.pr_metadata.outputs.should_run == 'true'
     runs-on: linux-amd64-cpu8
+    timeout-minutes: 30
     container:
       image: ghcr.io/nvidia/openshell/ci:latest
       credentials:

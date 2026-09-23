@@ -38,6 +38,10 @@ const MAIN_PROCESS_SPEC_BASE64URL_PREFIX: &str = "base64url:";
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct MainProcessConfig {
     pub version: u32,
+    /// Canonical command. Empty means "no command supplied": the supervisor
+    /// asks the sandbox boundary to resolve the default login shell against
+    /// the agent image. A non-empty
+    /// command is the exact program+args and is run verbatim.
     pub command: Vec<String>,
     pub tty: bool,
     #[serde(default)]
@@ -47,11 +51,15 @@ pub struct MainProcessConfig {
 impl MainProcessConfig {
     pub const VERSION: u32 = 1;
 
+    /// Default config for a sandbox created without a command. The command is
+    /// left empty on purpose: the sandbox boundary picks a login shell that
+    /// exists in the agent image (bash when present, otherwise `/bin/sh`). A TTY is
+    /// requested because the default is an interactive login shell.
     #[must_use]
     pub fn scratch() -> Self {
         Self {
             version: Self::VERSION,
-            command: vec!["/bin/bash".to_string(), "-l".to_string()],
+            command: Vec::new(),
             tty: true,
             await_main_process_attachment: false,
         }
@@ -91,8 +99,13 @@ impl MainProcessConfig {
                 config.version
             ));
         }
-        if config.command.is_empty() || config.command[0].is_empty() {
-            return Err(format!("{MAIN_PROCESS_SPEC} command must not be empty"));
+        // An empty command is valid: it means "no command supplied", and the
+        // sandbox boundary resolves the default login shell. Only a present-but-blank
+        // program is rejected.
+        if !config.command.is_empty() && config.command[0].is_empty() {
+            return Err(format!(
+                "{MAIN_PROCESS_SPEC} command program must not be empty"
+            ));
         }
         Ok(config)
     }
@@ -105,7 +118,7 @@ impl MainProcessConfig {
     }
 
     /// Encode the versioned transport without whitespace for constrained
-    /// environment-variable transports such as libkrun.
+    /// environment-variable transports used by embedded runtimes.
     pub fn encode_driver_spec_base64url(
         spec: Option<&crate::proto::compute::v1::DriverSandboxSpec>,
     ) -> Result<String, serde_json::Error> {
@@ -121,6 +134,13 @@ pub const TELEMETRY_ENABLED: &str = "OPENSHELL_TELEMETRY_ENABLED";
 /// Supervisor pod/runtime topology. Kubernetes sidecar mode sets this to
 /// `"sidecar"`; the default combined supervisor path omits it.
 pub const SUPERVISOR_TOPOLOGY: &str = "OPENSHELL_SUPERVISOR_TOPOLOGY";
+
+/// The isolation backend admitted by the deployment configuration (RFC 0012).
+///
+/// Delivered on a channel separate from the topology descriptor so descriptor
+/// verification against the admitted backend is not self-referential. Required
+/// whenever a topology descriptor is supplied.
+pub const ADMITTED_ISOLATION_BACKEND: &str = "OPENSHELL_ADMITTED_ISOLATION_BACKEND";
 
 /// Network enforcement backend selected by the compute driver.
 pub const NETWORK_ENFORCEMENT_MODE: &str = "OPENSHELL_NETWORK_ENFORCEMENT_MODE";
@@ -153,6 +173,17 @@ pub const GATEWAY_TLS_SERVER_NAME: &str = "OPENSHELL_GATEWAY_TLS_SERVER_NAME";
 /// Directory where the network supervisor writes the proxy CA files consumed
 /// by workload child processes.
 pub const PROXY_TLS_DIR: &str = "OPENSHELL_PROXY_TLS_DIR";
+
+/// Optional path to a durable PEM-encoded interception CA certificate.
+/// Must be configured together with [`PROXY_CA_KEY`].
+pub const PROXY_CA_CERT: &str = "OPENSHELL_PROXY_CA_CERT";
+
+/// Optional path to the private key for [`PROXY_CA_CERT`].
+/// Must be configured together with the certificate path.
+pub const PROXY_CA_KEY: &str = "OPENSHELL_PROXY_CA_KEY";
+
+/// Whether the control-owned SSH Unix socket is shared across trusted UIDs.
+pub const SSH_SOCKET_SHARED: &str = "OPENSHELL_SSH_SOCKET_SHARED";
 
 /// Path to the CA certificate for mTLS communication with the gateway.
 pub const TLS_CA: &str = "OPENSHELL_TLS_CA";
@@ -282,5 +313,41 @@ mod tests {
         assert_eq!(config, MainProcessConfig::scratch());
         let encoded = serde_json::to_string(&config).unwrap();
         assert_eq!(MainProcessConfig::decode(&encoded).unwrap(), config);
+    }
+
+    #[test]
+    fn omitted_command_stays_empty_for_supervisor_resolution() {
+        // No command supplied → empty command; the sandbox boundary resolves the
+        // default login shell against the sandbox image.
+        let empty = crate::proto::compute::v1::DriverSandboxSpec::default();
+        assert!(
+            MainProcessConfig::from_driver_spec(Some(&empty))
+                .command
+                .is_empty()
+        );
+        assert!(MainProcessConfig::from_driver_spec(None).command.is_empty());
+
+        // An explicit command is preserved verbatim and never rewritten.
+        let explicit = crate::proto::compute::v1::DriverSandboxSpec {
+            command: vec!["/bin/bash".into(), "-l".into()],
+            tty: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            MainProcessConfig::from_driver_spec(Some(&explicit)).command,
+            vec!["/bin/bash".to_string(), "-l".to_string()]
+        );
+
+        // An empty command survives the transport round-trip.
+        let encoded = serde_json::to_string(&MainProcessConfig::scratch()).unwrap();
+        assert!(
+            MainProcessConfig::decode(&encoded)
+                .unwrap()
+                .command
+                .is_empty()
+        );
+
+        // A present-but-blank program is still rejected.
+        assert!(MainProcessConfig::decode(r#"{"version":1,"command":[""],"tty":false}"#).is_err());
     }
 }

@@ -3,7 +3,7 @@
 
 [package]
 name = "openshell-supervisor-network"
-description = "Network component of the OpenShell supervisor: proxy, L7 enforcement, OPA, inference routing, denial aggregator"
+description = "Network component of the OpenShell supervisor: proxy, L7 enforcement, OPA, and denial aggregation"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -11,11 +11,16 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+sha2 = { workspace = true }
+openshell-binary-identity = { path = "../openshell-binary-identity" }
+openshell-crypto = { workspace = true }
 openshell-core = { path = "../openshell-core", features = ["oauth"] }
+openshell-isolation-interface = { path = "../openshell-isolation-interface" }
 openshell-ocsf = { path = "../openshell-ocsf" }
 openshell-policy = { path = "../openshell-policy" }
-openshell-router = { path = "../openshell-router" }
 openshell-supervisor-middleware = { path = "../openshell-supervisor-middleware" }
+
+async-trait = "0.1"
 
 apollo-parser = { workspace = true }
 aws-sigv4 = { version = "1", features = ["sign-http", "http1"] }
@@ -25,14 +30,15 @@ http = { workspace = true }
 base64 = { workspace = true }
 bytes = { workspace = true }
 flate2 = "1"
+futures = { workspace = true }
 glob = { workspace = true }
 hex = "0.4"
 hickory-proto = "0.26.1"
 ipnet = "2"
 miette = { workspace = true }
 prost-types = { workspace = true }
-rcgen = { workspace = true }
-regorus = { version = "0.9", default-features = false, features = ["std", "arc", "glob"] }
+rcgen = { workspace = true, features = ["x509-parser"] }
+regorus = { version = "0.9", default-features = false, features = ["std", "arc", "glob", "yaml"] }
 reqwest = { workspace = true }
 rustls = { workspace = true }
 rustls-native-certs = { workspace = true }
@@ -41,8 +47,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yml = { workspace = true }
 sha1 = "0.10"
-sha2 = { workspace = true }
 spiffe = { workspace = true }
+tempfile = "3"
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-rustls = { workspace = true }
@@ -56,13 +62,12 @@ default = ["bundled-ca-roots"]
 bundled-ca-roots = ["dep:webpki-roots"]
 
 [dev-dependencies]
+openshell-ocsf = { path = "../openshell-ocsf", features = ["test-support"] }
 openshell-supervisor-middleware-builtins = { path = "../openshell-supervisor-middleware-builtins" }
-tempfile = "3"
 tonic = { workspace = true }
 temp-env = "0.3"
 tokio = { workspace = true, features = ["test-util"] }
 tokio-tungstenite = { workspace = true }
-futures = { workspace = true }
 tracing-subscriber = { workspace = true }
 tokio-stream = { workspace = true, features = ["net"] }
 

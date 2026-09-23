@@ -67,6 +67,7 @@ impl LocalDriver {
         match self {
             Self::Docker => vec![
                 "label=openshell.ai/managed-by=openshell".to_string(),
+                "label=openshell.ai/isolation-role=sandbox".to_string(),
                 format!("label=openshell.ai/sandbox-namespace={namespace}"),
                 format!("label=openshell.ai/sandbox-name={sandbox_name}"),
             ],
@@ -274,11 +275,27 @@ async fn stop_container_sandbox(
     sandbox_name: &str,
 ) -> Result<(), String> {
     let container_id = sandbox_container_id(engine, driver, namespace, sandbox_name)?;
-    let token = read_bootstrap_token(engine, &container_id)?;
-    require_non_expiring_token(&token, "local-driver bootstrap JWT")?;
+    if driver == LocalDriver::Docker {
+        run_engine(
+            engine,
+            &[
+                "exec".to_string(),
+                container_id.clone(),
+                "sh".to_string(),
+                "-c".to_string(),
+                format!("test ! -r {CONTAINER_TOKEN_MOUNT_PATH}"),
+            ],
+        )
+        .map_err(|error| {
+            format!("Docker sandbox workload must not be able to read its bootstrap JWT: {error}")
+        })?;
+    } else {
+        let token = read_bootstrap_token(engine, &container_id)?;
+        require_non_expiring_token(&token, "local-driver bootstrap JWT")?;
+    }
 
     run_engine(engine, &["stop".to_string(), container_id.clone()])?;
-    wait_for_container_running(engine, &container_id, false, Duration::from_secs(60)).await
+    wait_for_container_running(engine, &container_id, false, Duration::from_mins(1)).await
 }
 
 async fn wait_for_sandbox_error(sandbox_name: &str, timeout: Duration) -> Result<(), String> {
@@ -314,7 +331,7 @@ async fn restart_vm_sandbox(gateway: &ManagedGateway, sandbox_name: &str) -> Res
 
     gateway.stop()?;
     gateway.start()?;
-    wait_for_healthy(Duration::from_secs(120)).await
+    wait_for_healthy(Duration::from_mins(2)).await
 }
 
 async fn wait_for_driver_reconnect(driver: LocalDriver, sandbox_name: &str) -> Result<(), String> {
@@ -324,7 +341,7 @@ async fn wait_for_driver_reconnect(driver: LocalDriver, sandbox_name: &str) -> R
                 sandbox_name,
                 &["cat", RESTART_FILE],
                 "before-local-driver-restart",
-                Duration::from_secs(240),
+                Duration::from_mins(4),
             )
             .await
         }
@@ -333,7 +350,7 @@ async fn wait_for_driver_reconnect(driver: LocalDriver, sandbox_name: &str) -> R
                 sandbox_name,
                 &["echo", "vm-reconnect-ok"],
                 "vm-reconnect-ok",
-                Duration::from_secs(240),
+                Duration::from_mins(4),
             )
             .await
         }

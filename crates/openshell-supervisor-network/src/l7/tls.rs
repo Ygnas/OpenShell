@@ -8,16 +8,16 @@
 //! store, terminates TLS from the client (presenting dynamic certs per hostname),
 //! inspects the plaintext HTTP, then re-encrypts to upstream using real root CAs.
 
-use miette::{IntoDiagnostic, Result, miette};
-use rcgen::{CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose};
+use miette::{IntoDiagnostic, Result, WrapErr, miette};
+use openshell_crypto::pki::KeyPair;
+use rcgen::{CertificateParams, DnType, IsCa, KeyUsagePurpose};
+use rustls::ClientConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
-use rustls::{ClientConfig, ServerConfig};
 use std::collections::HashMap;
-use std::io::BufReader;
+use std::io::{BufReader, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::TcpStream;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 const MAX_CACHED_CERTS: usize = 256;
@@ -41,7 +41,7 @@ pub struct SandboxCa {
 impl SandboxCa {
     /// Generate a new ephemeral CA keypair.
     pub fn generate() -> Result<Self> {
-        let ca_key = KeyPair::generate().into_diagnostic()?;
+        let ca_key = openshell_crypto::pki::generate_keypair().into_diagnostic()?;
 
         let mut params = CertificateParams::default();
         params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
@@ -53,7 +53,7 @@ impl SandboxCa {
             .push(DnType::OrganizationName, "OpenShell");
         params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
 
-        let ca_cert = params.self_signed(&ca_key).into_diagnostic()?;
+        let ca_cert = openshell_crypto::pki::self_signed(params, &ca_key).into_diagnostic()?;
         let ca_cert_pem = ca_cert.pem();
 
         Ok(Self {
@@ -66,6 +66,75 @@ impl SandboxCa {
     /// Returns the CA certificate in PEM format.
     pub fn cert_pem(&self) -> &str {
         &self.ca_cert_pem
+    }
+
+    /// Returns the CA private key in PKCS#8 PEM format.
+    pub fn private_key_pem(&self) -> Result<String> {
+        self.ca_key.serialize_pem().into_diagnostic()
+    }
+
+    /// Load a durable CA certificate and matching private key from absolute paths.
+    pub fn load_from_paths(certificate_path: &Path, private_key_path: &Path) -> Result<Self> {
+        if !certificate_path.is_absolute() || !private_key_path.is_absolute() {
+            return Err(miette!(
+                "proxy CA certificate and key paths must be absolute"
+            ));
+        }
+        if certificate_path == private_key_path {
+            return Err(miette!(
+                "proxy CA certificate and private key must use different paths"
+            ));
+        }
+        let certificate_pem = std::fs::read_to_string(certificate_path)
+            .into_diagnostic()
+            .wrap_err_with(|| {
+                format!("read proxy CA certificate {}", certificate_path.display())
+            })?;
+        let private_key_pem = std::fs::read_to_string(private_key_path)
+            .into_diagnostic()
+            .wrap_err_with(|| {
+                format!("read proxy CA private key {}", private_key_path.display())
+            })?;
+        Self::from_pem(&certificate_pem, &private_key_pem)
+    }
+
+    /// Load a durable CA while preserving the exact certificate bytes supplied
+    /// by the provisioner for boundary launch replay.
+    pub fn from_pem(certificate_pem: &str, private_key_pem: &str) -> Result<Self> {
+        openshell_crypto::tls::ensure_default_provider();
+        let ca_key = KeyPair::from_pem(private_key_pem)
+            .into_diagnostic()
+            .wrap_err("parse proxy CA private key")?;
+        let certificates = rustls_pemfile::certs(&mut certificate_pem.as_bytes())
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .into_diagnostic()
+            .wrap_err("parse proxy CA certificate")?;
+        if certificates.len() != 1 {
+            return Err(miette!(
+                "proxy CA certificate file must contain exactly one certificate"
+            ));
+        }
+        let private_key = rustls_pemfile::private_key(&mut private_key_pem.as_bytes())
+            .into_diagnostic()
+            .wrap_err("parse proxy CA private key")?
+            .ok_or_else(|| miette!("proxy CA private key file contains no private key"))?;
+        openshell_crypto::tls::server_builder()
+            .with_no_client_auth()
+            .with_single_cert(certificates, private_key)
+            .into_diagnostic()
+            .wrap_err("proxy CA certificate and private key do not match")?;
+
+        let params = CertificateParams::from_ca_cert_pem(certificate_pem)
+            .into_diagnostic()
+            .wrap_err("parse proxy CA signing certificate")?;
+        let ca_cert = openshell_crypto::pki::self_signed(params, &ca_key)
+            .into_diagnostic()
+            .wrap_err("initialize proxy CA signer")?;
+        Ok(Self {
+            ca_cert,
+            ca_key,
+            ca_cert_pem: certificate_pem.to_string(),
+        })
     }
 }
 
@@ -113,19 +182,19 @@ impl CertCache {
 
     /// Generate a new leaf certificate for the given hostname.
     fn generate_leaf(&self, hostname: &str) -> Result<CertifiedLeaf> {
-        let leaf_key = KeyPair::generate().into_diagnostic()?;
+        let leaf_key = openshell_crypto::pki::generate_keypair().into_diagnostic()?;
 
         let mut params = CertificateParams::new(vec![hostname.to_string()]).into_diagnostic()?;
         params.distinguished_name.push(DnType::CommonName, hostname);
         params.use_authority_key_identifier_extension = true;
 
-        let leaf_cert = params
-            .signed_by(&leaf_key, &self.ca.ca_cert, &self.ca.ca_key)
-            .into_diagnostic()?;
+        let leaf_cert =
+            openshell_crypto::pki::signed_by(params, &leaf_key, &self.ca.ca_cert, &self.ca.ca_key)
+                .into_diagnostic()?;
 
         let leaf_der = CertificateDer::from(leaf_cert.der().to_vec());
         let ca_der = CertificateDer::from(self.ca.ca_cert.der().to_vec());
-        let key_der = PrivateKeyDer::try_from(leaf_key.serialize_der())
+        let key_der = PrivateKeyDer::try_from(leaf_key.serialize_der().into_diagnostic()?)
             .map_err(|e| miette::miette!("failed to serialize leaf key: {e}"))?;
 
         Ok(CertifiedLeaf {
@@ -153,7 +222,7 @@ impl ProxyTlsState {
     /// Get or generate a leaf cert for the hostname and return a TLS acceptor.
     fn acceptor_for(&self, hostname: &str) -> Result<TlsAcceptor> {
         let leaf = self.cert_cache.get_or_generate(hostname)?;
-        let mut server_config = ServerConfig::builder()
+        let mut server_config = openshell_crypto::tls::server_builder()
             .with_no_client_auth()
             .with_single_cert(leaf.cert_chain.clone(), leaf.private_key.clone_key())
             .into_diagnostic()?;
@@ -170,11 +239,14 @@ impl ProxyTlsState {
 /// Accept TLS from a sandbox client, presenting a dynamic cert for the hostname.
 ///
 /// Returns a TLS stream that can be used for plaintext HTTP inspection.
-pub async fn tls_terminate_client(
-    client: TcpStream,
+pub async fn tls_terminate_client<S>(
+    client: S,
     tls_state: &ProxyTlsState,
     hostname: &str,
-) -> Result<impl AsyncRead + AsyncWrite + Unpin + Send> {
+) -> Result<impl AsyncRead + AsyncWrite + Unpin + Send>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
     let acceptor = tls_state.acceptor_for(hostname)?;
     let tls_stream = acceptor.accept(client).await.into_diagnostic()?;
     Ok(tls_stream)
@@ -207,7 +279,7 @@ pub async fn tls_connect_upstream(
 /// `system_ca_bundle` is ignored because the native store already reflects all
 /// operator-installed trust anchors.
 pub fn build_upstream_client_config(system_ca_bundle: &str) -> Result<Arc<ClientConfig>> {
-    let mut config = ClientConfig::builder()
+    let mut config = openshell_crypto::tls::client_builder()
         .with_root_certificates(build_upstream_root_store(system_ca_bundle)?)
         .with_no_client_auth();
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
@@ -286,7 +358,7 @@ pub fn write_ca_files(
     std::fs::create_dir_all(output_dir).into_diagnostic()?;
 
     let ca_cert_path = output_dir.join("openshell-ca.pem");
-    std::fs::write(&ca_cert_path, ca.cert_pem()).into_diagnostic()?;
+    write_tls_output(&ca_cert_path, ca.cert_pem().as_bytes())?;
 
     // Combine system CAs with our sandbox CA
     let mut combined = system_ca_bundle.to_string();
@@ -296,9 +368,53 @@ pub fn write_ca_files(
     combined.push_str(ca.cert_pem());
 
     let combined_path = output_dir.join("ca-bundle.pem");
-    std::fs::write(&combined_path, &combined).into_diagnostic()?;
+    write_tls_output(&combined_path, combined.as_bytes())?;
 
     Ok((ca_cert_path, combined_path))
+}
+
+fn write_tls_output(path: &Path, contents: &[u8]) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(miette!(
+                "refusing to replace symlinked TLS output {}",
+                path.display()
+            ));
+        }
+        Ok(metadata) if !metadata.is_file() => {
+            return Err(miette!(
+                "refusing to replace non-file TLS output {}",
+                path.display()
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).into_diagnostic(),
+    }
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| miette!("TLS output has no parent: {}", path.display()))?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("create temporary TLS output in {}", parent.display()))?;
+    temporary
+        .write_all(contents)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("write temporary TLS output for {}", path.display()))?;
+    temporary
+        .as_file()
+        .sync_all()
+        .into_diagnostic()
+        .wrap_err_with(|| format!("sync temporary TLS output for {}", path.display()))?;
+    temporary.persist(path).map_err(|error| {
+        miette!(
+            "atomically install TLS output {}: {}",
+            path.display(),
+            error.error
+        )
+    })?;
+    Ok(())
 }
 
 /// Load PEM-encoded certificates from a string into a root certificate store.
@@ -465,7 +581,6 @@ mod tests {
 
     #[test]
     fn upstream_config_alpn() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
         let config = build_upstream_client_config("").unwrap();
         assert_eq!(config.alpn_protocols, vec![b"http/1.1".to_vec()]);
     }
@@ -558,5 +673,52 @@ mod tests {
             rustls_pemfile::certs(&mut reader).any(|r| r.is_ok()),
             "bundle should contain at least one cert",
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_ca_files_rejects_symlinked_outputs() {
+        use std::os::unix::fs::symlink;
+
+        for output_name in ["openshell-ca.pem", "ca-bundle.pem"] {
+            let ca = SandboxCa::generate().expect("generate CA");
+            let dir = tempfile::tempdir().expect("temporary directory");
+            let sentinel = dir.path().join("sentinel");
+            std::fs::write(&sentinel, b"unchanged").expect("write sentinel");
+            symlink(&sentinel, dir.path().join(output_name)).expect("create output symlink");
+
+            let error = write_ca_files(&ca, dir.path(), "")
+                .expect_err("symlinked TLS output must be rejected");
+            assert!(error.to_string().contains("symlinked TLS output"));
+            assert_eq!(
+                std::fs::read(&sentinel).expect("read sentinel"),
+                b"unchanged"
+            );
+        }
+    }
+
+    #[test]
+    fn durable_ca_round_trip_preserves_certificate_bytes() {
+        let generated = SandboxCa::generate().unwrap();
+        let certificate = generated.cert_pem().to_string();
+        let private_key = generated.private_key_pem().unwrap();
+        let loaded = SandboxCa::from_pem(&certificate, &private_key).unwrap();
+
+        assert_eq!(loaded.cert_pem(), certificate);
+        assert_eq!(loaded.private_key_pem().unwrap(), private_key);
+    }
+
+    #[test]
+    fn durable_ca_rejects_mismatched_key_and_relative_paths() {
+        let certificate = SandboxCa::generate().unwrap();
+        let other_key = SandboxCa::generate().unwrap();
+        assert!(
+            SandboxCa::from_pem(
+                certificate.cert_pem(),
+                &other_key.private_key_pem().unwrap()
+            )
+            .is_err()
+        );
+        assert!(SandboxCa::load_from_paths(Path::new("ca.pem"), Path::new("ca.key")).is_err());
     }
 }

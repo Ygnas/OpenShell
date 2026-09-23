@@ -10,8 +10,8 @@
 
 pub mod graphql;
 pub(crate) mod http;
-pub mod inference;
 pub mod jsonrpc;
+pub(crate) mod mcp;
 pub(crate) mod middleware;
 pub mod path;
 pub mod provider;
@@ -21,10 +21,18 @@ pub mod tls;
 pub(crate) mod token_grant_injection;
 pub(crate) mod websocket;
 
+use openshell_core::endpoint_status::{
+    EndpointObservationContext, EndpointObservationHandle, EndpointObservationSender,
+    EndpointResult,
+};
+use openshell_core::mcp::McpProtocolVersion;
 pub use openshell_policy::L7Protocol;
 use openshell_policy::{
     L7EndpointFields, validate_explicit_tcp_additional_fields, validate_l7_endpoint_semantics,
 };
+use std::sync::{Arc, Mutex};
+
+use crate::opa::PolicyGenerationGuard;
 
 pub(crate) fn build_credential_endpoint_mismatch_finding(
     policy_name: &str,
@@ -107,6 +115,17 @@ pub enum EnforcementMode {
 #[derive(Debug, Clone)]
 pub struct L7EndpointConfig {
     pub protocol: L7Protocol,
+    /// Opaque endpoint identity derived from the matched policy endpoint.
+    ///
+    /// The value is added to the supervisor's internal OPA data and carried
+    /// through path selection unchanged. It is never derived from the concrete
+    /// request host because that host may have matched a wildcard selector.
+    pub endpoint_id: String,
+    /// Hash of the complete canonical policy that supplied this endpoint.
+    ///
+    /// Internal OPA metadata binds a selected endpoint to its observation
+    /// inventory even while policy activation and inventory publication overlap.
+    pub policy_hash: String,
     /// Optional endpoint-level HTTP path glob used to select between L7
     /// protocols that share the same host:port.
     pub path: String,
@@ -119,6 +138,10 @@ pub struct L7EndpointConfig {
     /// MCP-only strict validation for tools/call params.name. Defaults to true
     /// for MCP endpoints and is ignored by other JSON-RPC-family protocols.
     pub mcp_strict_tool_names: bool,
+    /// Canonical MCP protocol revisions allowed by this endpoint.
+    ///
+    /// Non-MCP endpoints always carry an empty list.
+    pub mcp_versions: Vec<McpProtocolVersion>,
     /// When true, percent-encoded `/` (`%2F`) is preserved in path segments
     /// rather than rejected at the parser. Needed by upstreams like GitLab
     /// that embed `%2F` in namespaced project paths. Defaults to false.
@@ -144,6 +167,102 @@ pub struct L7EndpointConfig {
     /// AWS region override for `SigV4` signing. When set, takes precedence
     /// over hostname-based region extraction.
     pub signing_region: String,
+}
+
+/// Report the first network result for a selected tool endpoint.
+///
+/// Clones share the same pending handle, so only the first terminal result is
+/// accepted. The lock is never held across an await, and reporting remains
+/// nonblocking because the core sender uses a bounded `try_send` path.
+#[derive(Clone)]
+pub(crate) struct EndpointObserver {
+    sender: EndpointObservationSender,
+    observation: Arc<Mutex<Option<EndpointObservationHandle>>>,
+    uses_provider_credentials: bool,
+    policy_generation: Option<PolicyGenerationGuard>,
+}
+
+impl EndpointObserver {
+    /// Bind a selected endpoint to authority captured before request-state lookup.
+    ///
+    /// Selection, provider material, and observation authority must describe the
+    /// same installation. A stale policy selection never acquires a new epoch.
+    pub(crate) fn begin_captured(
+        sender: Option<&EndpointObservationSender>,
+        config: &L7EndpointConfig,
+        context: Option<&EndpointObservationContext>,
+        provider_revision: Option<u64>,
+        guard: Option<&PolicyGenerationGuard>,
+    ) -> Option<Self> {
+        if config.protocol != L7Protocol::Mcp
+            || config.endpoint_id.is_empty()
+            || config.policy_hash.is_empty()
+        {
+            // Only internal metadata from a complete MCP policy identifies
+            // the endpoint and configuration whose result can be published.
+            return None;
+        }
+        if guard.is_some_and(PolicyGenerationGuard::is_stale) {
+            // Equal policy hashes can recur after a reload; the pinned guard
+            // prevents an earlier selection from becoming current again.
+            return None;
+        }
+        let sender = sender?.clone();
+        let observation = sender.begin_captured(
+            context?,
+            config.endpoint_id.clone(),
+            &config.policy_hash,
+            provider_revision,
+        )?;
+        Some(Self {
+            sender,
+            observation: Arc::new(Mutex::new(Some(observation))),
+            uses_provider_credentials: config.provider_credentialed,
+            policy_generation: guard.cloned(),
+        })
+    }
+
+    /// Capture and bind an observation synchronously for isolated unit fixtures.
+    #[cfg(test)]
+    pub(crate) fn begin(
+        sender: Option<&EndpointObservationSender>,
+        config: &L7EndpointConfig,
+    ) -> Option<Self> {
+        let context = sender.and_then(EndpointObservationSender::capture);
+        Self::begin_captured(sender, config, context.as_ref(), None, None)
+    }
+
+    /// Report the first terminal exchange result, dropping later attempts.
+    pub(crate) fn observe(&self, result: EndpointResult) {
+        let Ok(mut pending) = self.observation.lock() else {
+            // Status reporting cannot interrupt traffic if another observer panicked.
+            return;
+        };
+        let Some(observation) = pending.take() else {
+            // Another clone already reported the result for this exchange.
+            return;
+        };
+        if self
+            .policy_generation
+            .as_ref()
+            .is_some_and(PolicyGenerationGuard::is_stale)
+        {
+            // The request may finish after its policy was replaced but before
+            // the replacement inventory arrives. Its old result cannot fill
+            // that activation gap, including a return to equal policy values.
+            return;
+        }
+        let _accepted = self.sender.try_observe(observation, result);
+    }
+
+    /// Report an endpoint mismatch or an unavailable provider credential.
+    pub(crate) fn observe_credential_failure(&self, endpoint_mismatch: bool) {
+        if endpoint_mismatch {
+            self.observe(EndpointResult::PolicyDenied);
+        } else if self.uses_provider_credentials {
+            self.observe(EndpointResult::CredentialUnavailable);
+        }
+    }
 }
 
 /// Result of an L7 policy decision for a single request.
@@ -172,7 +291,8 @@ pub struct L7RequestInfo {
 /// Parse an L7 endpoint config from a regorus Value (returned by Rego query).
 ///
 /// The value is expected to be the raw endpoint object from the Rego data,
-/// containing fields: `protocol`, optionally `tls`, `enforcement`.
+/// containing fields: `protocol`, optionally `tls`, `enforcement`, and the
+/// canonical `mcp_versions` array for MCP endpoints.
 pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
     let protocol_val = get_object_str(val, "protocol")?;
     let protocol = L7Protocol::parse(&protocol_val)?;
@@ -219,6 +339,8 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
     let allow_uninspected_credentials =
         get_object_bool(val, "allow_uninspected_credentials").unwrap_or(false);
     let provider_credentialed = get_object_bool(val, "provider_credentialed").unwrap_or(false);
+    let endpoint_id = get_object_str(val, "endpoint_id").unwrap_or_default();
+    let policy_hash = get_object_str(val, "policy_hash").unwrap_or_default();
     let websocket_graphql_policy =
         protocol == L7Protocol::Websocket && endpoint_has_graphql_policy(val);
     let graphql_max_body_bytes = get_object_u64(val, "graphql_max_body_bytes")
@@ -231,6 +353,11 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
         .unwrap_or(jsonrpc::DEFAULT_MAX_BODY_BYTES);
     let mcp_strict_tool_names = protocol == L7Protocol::Mcp
         && get_object_bool(val, "mcp_strict_tool_names").unwrap_or(true);
+    let mcp_versions = if protocol == L7Protocol::Mcp {
+        parse_canonical_mcp_versions(val)?
+    } else {
+        Vec::new()
+    };
 
     let credential_signing = match get_object_str(val, "credential_signing").as_deref() {
         Some("sigv4") => CredentialSigning::SigV4,
@@ -265,12 +392,15 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
 
     Some(L7EndpointConfig {
         protocol,
+        endpoint_id,
+        policy_hash,
         path: get_object_str(val, "path").unwrap_or_default(),
         tls,
         enforcement,
         graphql_max_body_bytes,
         json_rpc_max_body_bytes,
         mcp_strict_tool_names,
+        mcp_versions,
         allow_encoded_slash,
         websocket_credential_rewrite,
         request_body_credential_rewrite,
@@ -400,6 +530,27 @@ fn get_object_str(val: &regorus::Value, key: &str) -> Option<String> {
         },
         _ => None,
     }
+}
+
+fn parse_canonical_mcp_versions(val: &regorus::Value) -> Option<Vec<McpProtocolVersion>> {
+    let regorus::Value::Array(values) = get_object_value(val, "mcp_versions")? else {
+        return None;
+    };
+    let versions = values
+        .iter()
+        .map(|value| match value {
+            regorus::Value::String(value) => value.parse::<McpProtocolVersion>().ok(),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+
+    // Both policy ingress paths promise a non-empty, strictly ordered list.
+    // Rechecking that runtime contract prevents a dropped or corrupted
+    // projection from silently selecting a different wire profile.
+    if versions.is_empty() || !versions.windows(2).all(|pair| pair[0] < pair[1]) {
+        return None;
+    }
+    Some(versions)
 }
 
 fn endpoint_has_graphql_policy(val: &regorus::Value) -> bool {
@@ -868,9 +1019,11 @@ fn validate_mcp_params_field(
     has_tool: bool,
     mcp_strict_tool_names: bool,
 ) {
-    let Some(params) = rule.get("params").filter(|v| !v.is_null()) else {
+    let Some(params) = rule.get("params") else {
         return;
     };
+    // Explicit params must be a map: tool alias lowering inserts params.name
+    // into it, so accepting null would discard the tool selector.
     let Some(params_obj) = params.as_object() else {
         errors.push(format!("{loc}.params: expected map of matchers"));
         return;
@@ -1252,6 +1405,7 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                     "{loc}: JSON-RPC-specific endpoint fields are ignored unless protocol is json-rpc or mcp"
                 ));
             }
+            validate_mcp_versions_field(&mut errors, &loc, ep, l7_protocol);
             let has_mcp_strict_tool_names = ep.get("mcp_strict_tool_names").is_some();
             let has_mcp_allow_all_known_mcp_methods =
                 ep.get("mcp_allow_all_known_mcp_methods").is_some();
@@ -1571,6 +1725,55 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
     (errors, warnings)
 }
 
+fn validate_mcp_versions_field(
+    errors: &mut Vec<String>,
+    loc: &str,
+    endpoint: &serde_json::Value,
+    protocol: Option<L7Protocol>,
+) {
+    let Some(value) = endpoint.get("mcp_versions") else {
+        return;
+    };
+    if protocol != Some(L7Protocol::Mcp) {
+        errors.push(format!(
+            "{loc}: mcp.versions is only valid for protocol mcp"
+        ));
+        return;
+    }
+    let Some(values) = value.as_array() else {
+        errors.push(format!("{loc}: mcp.versions must be an array"));
+        return;
+    };
+    if values.is_empty() {
+        errors.push(format!("{loc}: mcp.versions must not be empty"));
+        return;
+    }
+
+    let mut versions = Vec::with_capacity(values.len());
+    for value in values {
+        let Some(value) = value.as_str() else {
+            errors.push(format!("{loc}: mcp.versions entries must be strings"));
+            return;
+        };
+        let Ok(version) = value.parse::<McpProtocolVersion>() else {
+            errors.push(format!(
+                "{loc}: mcp.versions contains an unsupported protocol version"
+            ));
+            return;
+        };
+        versions.push(version);
+    }
+
+    // Runtime ingress has already normalized the allowlist. Requiring strict
+    // order here catches duplicates and bypasses that could otherwise fail
+    // later by removing L7 inspection from the selected route.
+    if !versions.windows(2).all(|pair| pair[0] < pair[1]) {
+        errors.push(format!(
+            "{loc}: mcp.versions must be unique and in canonical order"
+        ));
+    }
+}
+
 /// Map a supported L7 `access` preset to explicit rules for `protocol`.
 ///
 /// Returns `None` when `access` is not `read-only`, `read-write`, or `full`.
@@ -1762,6 +1965,271 @@ mod tests {
         assert_eq!(config.enforcement, EnforcementMode::Audit);
     }
 
+    #[tokio::test]
+    async fn endpoint_observation_classifies_only_bound_credential_failure() {
+        use openshell_core::endpoint_status::{
+            EndpointConfigVersion, EndpointInventoryEntry, EndpointResult, EndpointStatusCommand,
+            endpoint_status_channel,
+        };
+
+        let endpoint_id = "endpoint:v1:credential".to_string();
+        let (sender, mut receiver) = endpoint_status_channel();
+        sender
+            .reset(
+                EndpointConfigVersion {
+                    policy_hash: "policy".to_string(),
+                    provider_env_revision: 1,
+                },
+                vec![EndpointInventoryEntry {
+                    endpoint_id: endpoint_id.clone(),
+                    uses_provider_credentials: true,
+                }],
+            )
+            .await
+            .expect("install MCP test inventory");
+        let _reset = receiver.recv().await.expect("inventory reset");
+        let value = regorus::Value::from_json_str(&format!(
+            r#"{{"protocol":"mcp","mcp_versions":["2025-11-25"],"endpoint_id":"{endpoint_id}","policy_hash":"policy","provider_credentialed":true}}"#
+        ))
+        .expect("parse MCP config JSON");
+        let config = parse_l7_config(&value).expect("parse MCP config");
+        let observer = EndpointObserver::begin(Some(&sender), &config).expect("begin observation");
+
+        observer.observe_credential_failure(false);
+
+        assert!(matches!(
+            receiver.recv().await.expect("credential observation"),
+            EndpointStatusCommand::Observe {
+                result: EndpointResult::CredentialUnavailable,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn endpoint_observation_rejects_old_policy_selection_after_inventory_reset() {
+        use openshell_core::endpoint_status::{
+            EndpointConfigVersion, EndpointInventoryEntry, endpoint_status_channel,
+        };
+
+        let endpoint_id = "endpoint:v1:shared";
+        let inventory = vec![EndpointInventoryEntry {
+            endpoint_id: endpoint_id.to_string(),
+            uses_provider_credentials: false,
+        }];
+        let (sender, mut receiver) = endpoint_status_channel();
+        let mut tracker = receiver.tracker();
+        sender
+            .reset(
+                EndpointConfigVersion {
+                    policy_hash: "policy-a".to_string(),
+                    provider_env_revision: 1,
+                },
+                inventory.clone(),
+            )
+            .await
+            .expect("install first policy inventory");
+        assert!(tracker.apply(receiver.recv().await.expect("first inventory reset")));
+        let value = regorus::Value::from_json_str(
+            r#"{"protocol":"mcp","mcp_versions":["2025-11-25"],"endpoint_id":"endpoint:v1:shared","policy_hash":"policy-a"}"#,
+        )
+        .expect("parse first policy selection");
+        let selected = parse_l7_config(&value).expect("select first policy endpoint");
+
+        // The replacement retains the endpoint address while changing policy.
+        // A delayed selection must not acquire the replacement's authority.
+        sender
+            .reset(
+                EndpointConfigVersion {
+                    policy_hash: "policy-b".to_string(),
+                    provider_env_revision: 1,
+                },
+                inventory,
+            )
+            .await
+            .expect("install replacement policy inventory");
+        assert!(tracker.apply(receiver.recv().await.expect("replacement inventory reset")));
+        if let Some(observer) = EndpointObserver::begin(Some(&sender), &selected) {
+            observer.observe(EndpointResult::PolicyDenied);
+        }
+        while let Ok(command) = receiver.try_recv() {
+            tracker.apply(command);
+        }
+
+        let snapshot = tracker
+            .snapshot()
+            .expect("replacement inventory remains installed");
+        assert_eq!(snapshot.config_version.policy_hash, "policy-b");
+        assert_eq!(snapshot.endpoints.len(), 1);
+        assert_eq!(
+            snapshot.endpoints[0].result,
+            EndpointResult::NoObservedExchange
+        );
+    }
+
+    #[tokio::test]
+    async fn endpoint_observation_rejects_new_policy_selection_before_inventory_reset() {
+        use openshell_core::endpoint_status::{
+            EndpointConfigVersion, EndpointInventoryEntry, endpoint_status_channel,
+        };
+
+        let (sender, mut receiver) = endpoint_status_channel();
+        let mut tracker = receiver.tracker();
+        sender
+            .reset(
+                EndpointConfigVersion {
+                    policy_hash: "policy-a".to_string(),
+                    provider_env_revision: 1,
+                },
+                vec![EndpointInventoryEntry {
+                    endpoint_id: "endpoint:v1:shared".to_string(),
+                    uses_provider_credentials: false,
+                }],
+            )
+            .await
+            .expect("install first policy inventory");
+        assert!(tracker.apply(receiver.recv().await.expect("first inventory reset")));
+        // The runtime can install the new policy before its inventory reset.
+        // The new policy's result must not be attributed to the old inventory.
+        let value = regorus::Value::from_json_str(
+            r#"{"protocol":"mcp","mcp_versions":["2025-11-25"],"endpoint_id":"endpoint:v1:shared","policy_hash":"policy-b"}"#,
+        )
+        .expect("parse replacement policy selection");
+        let selected = parse_l7_config(&value).expect("select replacement policy endpoint");
+        if let Some(observer) = EndpointObserver::begin(Some(&sender), &selected) {
+            observer.observe(EndpointResult::HttpResponseReceived);
+        }
+        while let Ok(command) = receiver.try_recv() {
+            tracker.apply(command);
+        }
+
+        let snapshot = tracker
+            .snapshot()
+            .expect("first inventory remains installed");
+        assert_eq!(snapshot.config_version.policy_hash, "policy-a");
+        assert_eq!(snapshot.endpoints.len(), 1);
+        assert_eq!(
+            snapshot.endpoints[0].result,
+            EndpointResult::NoObservedExchange
+        );
+    }
+
+    #[tokio::test]
+    async fn endpoint_observation_rejects_stale_policy_guards_without_disabling_fresh_requests() {
+        use openshell_core::endpoint_status::{
+            EndpointConfigVersion, EndpointInventoryEntry, endpoint_status_channel,
+        };
+
+        let policy = openshell_policy::restrictive_default_policy();
+        let engine = crate::opa::OpaEngine::from_proto(&policy).expect("test policy engine");
+        let (sender, mut receiver) = endpoint_status_channel();
+        let mut tracker = receiver.tracker();
+        sender
+            .reset(
+                EndpointConfigVersion {
+                    policy_hash: "policy".to_string(),
+                    provider_env_revision: 1,
+                },
+                vec![EndpointInventoryEntry {
+                    endpoint_id: "endpoint:v1:shared".to_string(),
+                    uses_provider_credentials: false,
+                }],
+            )
+            .await
+            .expect("install test inventory");
+        assert!(tracker.apply(receiver.recv().await.expect("inventory reset")));
+        let context = sender.capture().expect("capture installed authority");
+        let value = regorus::Value::from_json_str(
+            r#"{"protocol":"mcp","mcp_versions":["2025-11-25"],"endpoint_id":"endpoint:v1:shared","policy_hash":"policy"}"#,
+        )
+        .expect("parse selected MCP policy");
+        let selected = parse_l7_config(&value).expect("selected MCP endpoint");
+        let previous_guard = engine
+            .generation_guard(engine.current_generation())
+            .expect("capture initial policy guard");
+        let previous_observer = EndpointObserver::begin_captured(
+            Some(&sender),
+            &selected,
+            Some(&context),
+            Some(1),
+            Some(&previous_guard),
+        )
+        .expect("current policy can begin an observation");
+
+        // Runtime generations can advance while the canonical policy and
+        // inventory stay equal. Only new selections may use the new runtime.
+        engine
+            .reload_from_proto(&policy)
+            .expect("reinstall same policy");
+        assert!(
+            EndpointObserver::begin_captured(
+                Some(&sender),
+                &selected,
+                Some(&context),
+                Some(1),
+                Some(&previous_guard),
+            )
+            .is_none()
+        );
+        previous_observer.observe(EndpointResult::HttpResponseReceived);
+        while let Ok(command) = receiver.try_recv() {
+            tracker.apply(command);
+        }
+        assert_eq!(
+            tracker
+                .snapshot()
+                .expect("inventory remains installed")
+                .endpoints[0]
+                .result,
+            EndpointResult::NoObservedExchange,
+        );
+
+        let current_guard = engine
+            .generation_guard(engine.current_generation())
+            .expect("capture replacement policy guard");
+        let current_observer = EndpointObserver::begin_captured(
+            Some(&sender),
+            &selected,
+            Some(&context),
+            Some(1),
+            Some(&current_guard),
+        )
+        .expect("fresh selection stays observable without an inventory reset");
+        current_observer.observe(EndpointResult::HttpResponseReceived);
+        assert!(tracker.apply(receiver.recv().await.expect("fresh policy observation")));
+        assert_eq!(
+            tracker
+                .snapshot()
+                .expect("inventory remains installed")
+                .endpoints[0]
+                .result,
+            EndpointResult::HttpResponseReceived,
+        );
+    }
+
+    #[tokio::test]
+    async fn non_mcp_endpoint_never_begins_an_observation() {
+        use openshell_core::endpoint_status::{EndpointConfigVersion, endpoint_status_channel};
+
+        let (sender, _receiver) = endpoint_status_channel();
+        sender
+            .reset(
+                EndpointConfigVersion {
+                    policy_hash: "policy".to_string(),
+                    provider_env_revision: 1,
+                },
+                Vec::new(),
+            )
+            .await
+            .expect("install MCP test configuration");
+        let value = regorus::Value::from_json_str(
+            r#"{"protocol":"rest","endpoint_id":"endpoint:v1:not-mcp"}"#,
+        )
+        .expect("parse REST config JSON");
+        let config = parse_l7_config(&value).expect("parse REST config");
+        assert!(EndpointObserver::begin(Some(&sender), &config).is_none());
+    }
+
     #[test]
     fn parse_credential_signing_sigv4() {
         let val = regorus::Value::from_json_str(
@@ -1884,7 +2352,7 @@ mod tests {
     #[test]
     fn parse_l7_config_mcp_strict_tool_names_defaults_true() {
         let val = regorus::Value::from_json_str(
-            r#"{"protocol": "mcp", "host": "mcp.example.com", "port": 443}"#,
+            r#"{"protocol": "mcp", "host": "mcp.example.com", "port": 443, "mcp_versions": ["2025-11-25"]}"#,
         )
         .unwrap();
         let config = parse_l7_config(&val).unwrap();
@@ -1894,11 +2362,51 @@ mod tests {
     #[test]
     fn parse_l7_config_mcp_strict_tool_names_can_disable() {
         let val = regorus::Value::from_json_str(
-            r#"{"protocol": "mcp", "host": "mcp.example.com", "port": 443, "mcp_strict_tool_names": false}"#,
+            r#"{"protocol": "mcp", "host": "mcp.example.com", "port": 443, "mcp_strict_tool_names": false, "mcp_versions": ["2025-11-25"]}"#,
         )
         .unwrap();
         let config = parse_l7_config(&val).unwrap();
         assert!(!config.mcp_strict_tool_names);
+    }
+
+    #[test]
+    fn parse_l7_config_requires_canonical_mcp_versions() {
+        let explicit = regorus::Value::from_json_str(
+            r#"{"protocol": "mcp", "mcp_versions": ["2025-03-26", "2025-11-25"]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            parse_l7_config(&explicit).unwrap().mcp_versions,
+            vec![
+                McpProtocolVersion::V2025_03_26,
+                McpProtocolVersion::V2025_11_25
+            ]
+        );
+
+        for invalid in [
+            r#"{"protocol": "mcp"}"#,
+            r#"{"protocol": "mcp", "mcp_versions": []}"#,
+            r#"{"protocol": "mcp", "mcp_versions": ["2026-01-01"]}"#,
+            r#"{"protocol": "mcp", "mcp_versions": [1]}"#,
+            r#"{"protocol": "mcp", "mcp_versions": ["2025-11-25", "2025-11-25"]}"#,
+            r#"{"protocol": "mcp", "mcp_versions": ["2025-11-25", "2025-03-26"]}"#,
+        ] {
+            let value = regorus::Value::from_json_str(invalid).unwrap();
+            assert!(
+                parse_l7_config(&value).is_none(),
+                "non-canonical MCP runtime config must be rejected: {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_l7_config_keeps_mcp_versions_off_other_protocols() {
+        let value = regorus::Value::from_json_str(
+            r#"{"protocol": "json-rpc", "mcp_versions": ["2025-11-25"]}"#,
+        )
+        .unwrap();
+
+        assert!(parse_l7_config(&value).unwrap().mcp_versions.is_empty());
     }
 
     #[test]

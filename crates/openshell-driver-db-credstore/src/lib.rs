@@ -26,10 +26,7 @@ use openshell_core::proto::credentials::v1::{
     DeleteCredentialRequest, ResolveCredentialRequest, ResolvedCredential, StoreCredentialRequest,
 };
 use openshell_core::{Error, Result as CoreResult};
-use ring::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
-use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use tonic::Status;
 
 const HANDLE_VERSION: &str = "v1";
@@ -304,7 +301,7 @@ impl DbCredstoreCredentialDriver {
             Ok::<_, Status>(ResolvedCredential {
                 request_id: request.request_id,
                 value,
-                expires_at_ms: 0,
+                expiration_time: None,
             })
         });
         futures::future::try_join_all(futures).await
@@ -477,7 +474,7 @@ impl EncryptedGatewayCredentialSettings {
 impl EncryptedGatewayCredentialState {
     fn from_settings(settings: EncryptedGatewayCredentialSettings) -> CoreResult<Self> {
         let key_encryption_key = load_key_encryption_key(&settings)?;
-        let key_encryption_key_id = key_id(&key_encryption_key);
+        let key_encryption_key_id = key_id(&key_encryption_key)?;
         Ok(Self {
             settings,
             key_encryption_key,
@@ -723,18 +720,11 @@ fn encrypt_bytes(
     aad: &[u8],
     plaintext: &[u8],
 ) -> Result<EncryptedBytes, Status> {
-    let nonce = random_bytes_status::<NONCE_LEN>()?;
-    let key = aead_key(key_bytes)?;
-    let mut in_out = plaintext.to_vec();
-    key.seal_in_place_append_tag(
-        Nonce::assume_unique_for_key(nonce),
-        Aad::from(aad),
-        &mut in_out,
-    )
-    .map_err(|_| Status::internal("failed to encrypt default credential storage value"))?;
+    let sealed = openshell_crypto::aead::seal(key_bytes, aad, plaintext)
+        .map_err(|_| Status::internal("failed to encrypt default credential storage value"))?;
     Ok(EncryptedBytes {
-        nonce: BASE64.encode(nonce),
-        ciphertext: BASE64.encode(in_out),
+        nonce: BASE64.encode(sealed.nonce),
+        ciphertext: BASE64.encode(sealed.ciphertext),
     })
 }
 
@@ -744,23 +734,9 @@ fn decrypt_bytes(
     encrypted: &EncryptedBytes,
 ) -> Result<Vec<u8>, Status> {
     let nonce = decode_b64_array::<NONCE_LEN>("nonce", &encrypted.nonce)?;
-    let mut in_out = decode_b64_vec("ciphertext", &encrypted.ciphertext)?;
-    let key = aead_key(key_bytes)?;
-    let plaintext = key
-        .open_in_place(
-            Nonce::assume_unique_for_key(nonce),
-            Aad::from(aad),
-            &mut in_out,
-        )
-        .map_err(|_| Status::data_loss("failed to decrypt default credential storage value"))?;
-    Ok(plaintext.to_vec())
-}
-
-fn aead_key(key_bytes: &[u8; KEY_LEN]) -> Result<LessSafeKey, Status> {
-    let unbound = UnboundKey::new(&AES_256_GCM, key_bytes).map_err(|_| {
-        Status::internal("failed to initialize default credential storage AEAD key")
-    })?;
-    Ok(LessSafeKey::new(unbound))
+    let ciphertext = decode_b64_vec("ciphertext", &encrypted.ciphertext)?;
+    openshell_crypto::aead::open(key_bytes, aad, &nonce, &ciphertext)
+        .map_err(|_| Status::data_loss("failed to decrypt default credential storage value"))
 }
 
 fn dek_aad(id: &str, provider_name: &str, credential_key: &str) -> Vec<u8> {
@@ -898,23 +874,23 @@ fn fixed_bytes<const N: usize>(bytes: &[u8]) -> Result<[u8; N], ()> {
 
 fn random_bytes_core<const N: usize>() -> CoreResult<[u8; N]> {
     let mut bytes = [0_u8; N];
-    SystemRandom::new()
-        .fill(&mut bytes)
+    openshell_crypto::fill_random(&mut bytes)
         .map_err(|_| Error::config("failed to generate default credential storage key material"))?;
     Ok(bytes)
 }
 
 fn random_bytes_status<const N: usize>() -> Result<[u8; N], Status> {
     let mut bytes = [0_u8; N];
-    SystemRandom::new().fill(&mut bytes).map_err(|_| {
+    openshell_crypto::fill_random(&mut bytes).map_err(|_| {
         Status::internal("failed to generate default credential storage randomness")
     })?;
     Ok(bytes)
 }
 
-fn key_id(key: &[u8; KEY_LEN]) -> String {
-    let digest = Sha256::digest(key);
-    format!("sha256:{}", hex_encode(&digest))
+fn key_id(key: &[u8; KEY_LEN]) -> CoreResult<String> {
+    let digest = openshell_crypto::sha256(key)
+        .map_err(|_| Error::config("failed to derive default credential storage key ID"))?;
+    Ok(format!("sha256:{}", hex_encode(&digest)))
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -932,6 +908,38 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
     use tonic::Code;
+
+    #[test]
+    fn persisted_aes_gcm_ciphertexts_remain_compatible() {
+        // Fixed, non-secret ciphertexts produced by the previous crypto backend.
+        let cases = [
+            (
+                [0x11; KEY_LEN],
+                [0x22; NONCE_LEN],
+                dek_aad("fixture", "provider", "api_key"),
+                vec![0x33; KEY_LEN],
+                "JMQ0evP8rGzWDO0Pe5Xa5iyg/tFZsp94YXw52zrSVjCoSMvKkAYj5kygMADT9jIW",
+            ),
+            (
+                [0x33; KEY_LEN],
+                [0x44; NONCE_LEN],
+                value_aad("fixture", "provider", "api_key"),
+                b"fixture-secret".to_vec(),
+                "Vvi85r906kbT58fgk+mUIc/KA4ar8d3Syu8Jz5h1",
+            ),
+        ];
+        for (key, nonce, aad, plaintext, ciphertext) in cases {
+            let encrypted = EncryptedBytes {
+                nonce: BASE64.encode(nonce),
+                ciphertext: ciphertext.to_string(),
+            };
+            assert_eq!(decrypt_bytes(&key, &aad, &encrypted).unwrap(), plaintext);
+            let sealed = encrypt_bytes(&key, &aad, &plaintext).unwrap();
+            assert_eq!(decrypt_bytes(&key, &aad, &sealed).unwrap(), plaintext);
+            assert!(decrypt_bytes(&key, b"wrong-aad", &encrypted).is_err());
+            assert!(decrypt_bytes(&[0xff; KEY_LEN], &aad, &encrypted).is_err());
+        }
+    }
 
     #[derive(Debug, Default)]
     struct MemoryObjectStore {

@@ -1,0 +1,41 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: OpenSSL Backend / FIPS Readiness
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  openssl-contract:
+    name: OpenSSL contract and dependency closure
+    runs-on: ubuntu-latest
+    container: rust:1.94-bookworm
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install OpenSSL build dependencies
+        run: |
+          apt-get update
+          apt-get install --yes --no-install-recommends pkg-config libssl-dev openssl
+          rustup component add rustfmt clippy
+
+      - name: Report OpenSSL provider inventory
+        run: |
+          openssl version -a
+          openssl list -providers
+
+      - name: Validate opt-in backend
+        run: bash examples/openssl-crypto-poc/validate.sh

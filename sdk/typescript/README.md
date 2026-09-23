@@ -41,8 +41,26 @@ await client.sandbox.waitReady(sandbox.name, 120)
 const result = await client.sandbox.exec(sandbox.name, ['/bin/sh', '-c', 'echo hello'])
 console.log(result.stdout.toString())
 
-await client.sandbox.delete(sandbox.name)
+const deletion = await client.sandbox.delete(sandbox.name)
+console.log(deletion.outcome) // completed, accepted, or already_absent
+if (deletion.outcome === 'accepted') {
+  await client.sandbox.waitDeleted(sandbox.name, 60, {
+    expectedSandboxId: deletion.sandboxId,
+  })
+}
 ```
+
+Deletion returns a typed result, not a boolean. `accepted` means cleanup is
+pending; `unspecified` and unknown outcomes do not establish completion.
+`sandboxId` identifies the original sandbox. Missing targets are errors unless
+you pass `{ allowMissing: true }`; this does not suppress missing parents or make
+retries safe when names are reused. Upgrade gateway and SDK together for this
+pre-1.0 API change.
+
+`waitDeleted` with `expectedSandboxId` completes when the name is absent or
+resolves to a different ID. Without that option, it waits for name absence,
+including any same-name replacement. Pass the same `workspace` to deletion and
+its wait when using a non-default workspace.
 
 `connect()` constructs a lazy client; call `health()` when startup must verify
 gateway reachability. Static `oidcToken` and `edgeToken` values remain fixed for
@@ -152,11 +170,65 @@ await client.sandbox.setSetting(name, 'feature.enabled', { value: { case: 'boolV
 
 Sandbox-scoped `setPolicy` may only change `networkPolicies`; static fields (`filesystem`, `landlock`, `process`) must match the create-time policy. Sandbox-scoped setting deletes are rejected by the gateway, so only upsert (`setSetting`) is exposed here.
 
+## Sandbox templates
+
+Sandbox workload templates are reusable, workspace-scoped runtime shapes. They
+own image, environment, resource, and driver-specific settings; sandbox creation
+from a template can still attach labels, providers, and create-time policy.
+
+```ts
+import { OpenShellClient, type SandboxWorkloadTemplate } from '@nvidia/openshell-sdk'
+
+const client = await OpenShellClient.connect({ gateway, oidcToken })
+
+const template: SandboxWorkloadTemplate = await client.sandboxTemplates.create(
+  {
+    metadata: { name: 'python', labels: { team: 'runtime' } },
+    spec: {
+      workload: {
+        image: 'ghcr.io/nvidia/openshell-community/sandboxes/python:latest',
+        environment: { FEATURE_FLAG: 'on' },
+        resources: { cpu: '1', memory: '512Mi' },
+      },
+      driverConfig: { kubernetes: { pod: { runtime_class_name: 'kata-containers' } } },
+    },
+  },
+  { workspace: 'default' },
+)
+
+const sandbox = await client.sandbox.createFromTemplate({
+  templateName: template.metadata!.name,
+  workspace: 'default',
+  providers: ['github'],
+  policy: { version: 1, networkPolicies: {} },
+})
+
+await client.sandboxTemplates.get('python', { workspace: 'default' })
+await client.sandboxTemplates.listAll({ workspace: 'default', pageSize: 100 })
+await client.sandboxTemplates.delete('python', { workspace: 'default' })
+```
+
+Use `allWorkspaces: true` on `list()` for a platform-admin view. The
+discriminated option type makes `workspace` and `allWorkspaces` mutually
+exclusive. Omitting both options explicitly selects the `default` workspace.
+List methods follow continuation tokens through a lazy `Pager`; each advance
+fetches one RPC page. Use `listAll()` only
+when you want to exhaust the collection. `pageSize` controls one request and
+`pageToken` resumes a saved traversal.
+
+```ts
+const pages = client.sandbox.list({ workspace: 'default', pageSize: 100 })
+for await (const page of pages) {
+  for (const sandbox of page.items) console.log(sandbox.name)
+}
+```
+
 ## Surface and roadmap
 
 The SDK's goal is agent parity: anything the OpenShell gateway can do should be reachable from typed code, not only the CLI. The API is organized as scoped sub-clients over one shared connection, mirroring the CLI's verbs.
 
 - `client.sandbox` (`SandboxClient`) is available today: sandbox lifecycle, exec, forward, SSH, sandbox-scoped providers, config, and policy.
+- `client.sandboxTemplates` (`SandboxTemplateClient`) is available today: reusable sandbox workload template CRUD.
 - `client.gateway` (`GatewayClient`) is planned: gateway-scoped config and settings, health, and cluster status.
 - `client.providers` (`ProviderClient`) is planned: gateway-scoped provider CRUD and profiles.
 
@@ -169,14 +241,24 @@ Curated methods are added deliberately, so some gateway RPCs are not yet wrapped
 `client.raw` is a generated client for every gateway RPC, including surface the curated sub-clients do not wrap yet (gateway config, provider CRUD, policy status, watch, logs, and the full observed `Sandbox`). `client.transport` is the shared connection, so extra clients reuse one socket. Generated request and response types live at `@nvidia/openshell-sdk/raw`.
 
 ```ts
+import { create } from '@bufbuild/protobuf'
 import { OpenShellClient } from '@nvidia/openshell-sdk'
+import { WorkspaceSelectorSchema } from '@nvidia/openshell-sdk/raw'
 import type { GetGatewayConfigResponse } from '@nvidia/openshell-sdk/raw'
 
 const client = await OpenShellClient.connect({ gateway, oidcToken })
 
 // Reach RPCs the curated surface does not wrap yet:
 const cfg: GetGatewayConfigResponse = await client.raw.getGatewayConfig({})
-const status = await client.raw.getSandboxPolicyStatus({ name: 'my-sandbox', version: 0, global: false })
+const defaultWorkspace = create(WorkspaceSelectorSchema, {
+  selection: { case: 'workspace', value: 'default' },
+})
+const status = await client.raw.getSandboxPolicyStatus({
+  name: 'my-sandbox',
+  version: 0,
+  global: false,
+  workspaceScope: defaultWorkspace,
+})
 ```
 
 The raw layer returns the generated wire messages verbatim, preserving proto distinctions (an omitted optional versus an explicitly empty map) that the curated types may smooth over. As curated sub-clients land, prefer them; `raw` stays as the always-available floor.

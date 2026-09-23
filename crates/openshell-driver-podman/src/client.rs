@@ -177,6 +177,8 @@ pub struct ImageInspect {
 pub struct ImageConfig {
     #[serde(default)]
     pub user: String,
+    #[serde(default)]
+    pub env: Vec<String>,
 }
 
 /// A container summary returned by the list API.
@@ -272,9 +274,13 @@ pub struct HostInfo {
 /// Podman returns `host.security.rootless: true` when the daemon is
 /// running without root privileges (rootless mode).
 #[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SecurityInfo {
     #[serde(default)]
     pub rootless: bool,
+    /// Whether the Podman host has `AppArmor` support enabled.
+    #[serde(default)]
+    pub apparmor_enabled: bool,
 }
 
 // ── Client ───────────────────────────────────────────────────────────────
@@ -444,6 +450,93 @@ impl PodmanClient {
     pub async fn create_container(&self, spec: &Value) -> Result<Value, PodmanApiError> {
         self.request_json(hyper::Method::POST, "/libpod/containers/create", Some(spec))
             .await
+    }
+
+    pub(crate) async fn create_typed_container(
+        &self,
+        spec: &(impl serde::Serialize + Sync),
+    ) -> Result<String, PodmanApiError> {
+        #[derive(serde::Deserialize)]
+        struct Created {
+            #[serde(rename = "Id", alias = "ID")]
+            id: String,
+        }
+        let body =
+            serde_json::to_vec(spec).map_err(|error| PodmanApiError::Json(error.to_string()))?;
+        let (status, bytes) = self
+            .request_raw(
+                hyper::Method::POST,
+                "/libpod/containers/create",
+                "application/json",
+                body.into(),
+            )
+            .await?;
+        if !status.is_success() {
+            return Err(error_from_response(status.as_u16(), &bytes));
+        }
+        let created: Created = serde_json::from_slice(&bytes)
+            .map_err(|error| PodmanApiError::Json(error.to_string()))?;
+        validate_name(&created.id)?;
+        Ok(created.id)
+    }
+
+    pub(crate) async fn copy_to_container(
+        &self,
+        name: &str,
+        destination: &str,
+        archive: Vec<u8>,
+    ) -> Result<(), PodmanApiError> {
+        validate_name(name)?;
+        let (status, bytes) = self
+            .request_raw(
+                hyper::Method::PUT,
+                &format!(
+                    "/libpod/containers/{name}/archive?path={}",
+                    url_encode(destination)
+                ),
+                "application/x-tar",
+                archive.into(),
+            )
+            .await?;
+        if status.is_success() {
+            Ok(())
+        } else {
+            Err(error_from_response(status.as_u16(), &bytes))
+        }
+    }
+
+    pub(crate) async fn verify_isolation_fence(&self, id: &str) -> Result<(), PodmanApiError> {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct HostConfig {
+            network_mode: String,
+            privileged: bool,
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct FenceInspect {
+            host_config: HostConfig,
+            network_settings: NetworkSettings,
+        }
+        validate_name(id)?;
+        let inspected: FenceInspect = self
+            .request_json(
+                hyper::Method::GET,
+                &format!("/libpod/containers/{id}/json"),
+                None,
+            )
+            .await?;
+        if inspected.host_config.network_mode != "none"
+            || inspected.host_config.privileged
+            || inspected
+                .network_settings
+                .networks
+                .keys()
+                .any(|name| name != "none")
+        {
+            return Err(PodmanApiError::InvalidInput("sandbox requires an unprivileged container with network mode none and no attached networks".into()));
+        }
+        Ok(())
     }
 
     /// Start a container by name or ID.
@@ -719,7 +812,7 @@ impl PodmanClient {
             url_encode(policy),
         );
         // Image pulls can be slow — use a generous timeout.
-        let pull_timeout = Duration::from_secs(600);
+        let pull_timeout = Duration::from_mins(10);
         let (status, bytes) = self
             .request(hyper::Method::POST, &path, None, pull_timeout)
             .await?;
@@ -959,13 +1052,17 @@ mod tests {
                     "cgroupVersion": "v2",
                     "networkBackend": "netavark",
                     "rootlessNetworkCmd": "pasta",
-                    "security": {"rootless": true}
+                    "security": {
+                        "rootless": true,
+                        "apparmorEnabled": true
+                    }
                 }
             }"#,
         )
         .unwrap();
 
         assert!(info.host.security.rootless);
+        assert!(info.host.security.apparmor_enabled);
         assert_eq!(info.host.rootless_network_cmd, "pasta");
     }
 

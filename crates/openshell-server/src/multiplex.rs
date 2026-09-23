@@ -17,9 +17,7 @@ use hyper_util::{
     service::TowerToHyperService,
 };
 use metrics::{counter, histogram};
-use openshell_core::proto::{
-    inference_server::InferenceServer, open_shell_server::OpenShellServer,
-};
+use openshell_core::proto::open_shell_server::OpenShellServer;
 use openshell_core::{
     Config,
     proto::{Provider, UpdateProviderRequest},
@@ -50,11 +48,9 @@ use crate::{
     auth::identity::Identity,
     auth::oidc::{self, OidcAuthenticator},
     auth::principal::{Principal, UserPrincipal},
-    auth::workspace_authz::{MinWorkspaceRole, authorize_workspace},
+    auth::workspace_authz::{MinWorkspaceRole, authorize_workspace_selector},
     gateway_listener::GatewayListenerScope,
-    http_router,
-    inference::InferenceService,
-    service_http_router,
+    http_router, service_http_router,
 };
 
 /// Request-ID generator that produces a UUID v4 for each inbound request.
@@ -277,8 +273,6 @@ impl MultiplexService {
             self.state.gateway_interceptors.clone(),
             Some(self.state.clone()),
         );
-        let inference = InferenceServer::new(InferenceService::new(self.state.clone()))
-            .max_decoding_message_size(MAX_GRPC_DECODE_SIZE);
         let authz_policy = self.state.config.oidc.as_ref().map(|oidc| AuthzPolicy {
             admin_role: oidc.admin_role.clone(),
             user_role: oidc.user_role.clone(),
@@ -286,7 +280,7 @@ impl MultiplexService {
         });
         let authenticator_chain = build_authenticator_chain(&self.state);
         let grpc_service = AuthGrpcRouter::with_peer_identity(
-            GrpcRouter::new(openshell, inference),
+            openshell,
             authenticator_chain,
             authz_policy,
             self.state
@@ -453,11 +447,14 @@ where
 
             let context = gateway_interceptor_context(req.extensions());
             let principal = req.extensions().get::<Principal>().cloned();
-            let (parts, body) = req.into_parts();
+            let (mut parts, body) = req.into_parts();
             let mut body = match collect_intercepted_grpc_body(body).await {
                 Ok(body) => body,
                 Err(status) => return Ok(status.into_http()),
             };
+            // Retain only in memory. evaluate_request below validates the single
+            // uncompressed frame before this extension reaches typed dispatch.
+            let original_body = body.clone();
             if let Some(state) = state.as_ref() {
                 body =
                     match hydrate_update_provider_identity(&path, body, state, principal.as_ref())
@@ -473,6 +470,12 @@ where
                 Err(status) => return Ok(status.into_http()),
             };
 
+            parts
+                .extensions
+                .insert(crate::grpc::mutation_replay::OriginalMutation(
+                    original_body[GRPC_FRAME_HEADER_LEN..].to_vec(),
+                ));
+
             let req = Request::from_parts(
                 parts,
                 boxed_body_from_bytes(Bytes::from(intercepted.body.clone())),
@@ -480,6 +483,10 @@ where
             let response = inner.ready().await?.call(req).await?;
 
             if grpc_status_from_response(&response) != "0"
+                || response
+                    .headers()
+                    .get("openshell-replayed")
+                    .is_some_and(|value| value == "true")
                 || !interceptors.has_post_commit(&intercepted)
             {
                 return Ok(response);
@@ -558,11 +565,11 @@ async fn hydrate_update_provider_identity(
 
     let principal =
         principal.ok_or_else(|| tonic::Status::unauthenticated("authentication required"))?;
-    let authorized = authorize_workspace(
+    let authorized = authorize_workspace_selector(
         state.store.as_ref(),
         &state.admin_role,
         principal,
-        &request.workspace,
+        request.workspace_scope.as_ref(),
         MinWorkspaceRole::Admin,
     )
     .await?;
@@ -745,7 +752,7 @@ fn gateway_principal_fields(principal: &Principal) -> BTreeMap<String, String> {
                 match &sandbox.source {
                     SandboxIdentitySource::BootstrapJwt { .. } => "bootstrap_jwt",
                     SandboxIdentitySource::BootstrapCert { .. } => "bootstrap_cert",
-                    SandboxIdentitySource::K8sServiceAccount { .. } => "k8s_service_account",
+                    SandboxIdentitySource::ComputeDriver { .. } => "compute_driver",
                 }
                 .to_string(),
             );
@@ -920,66 +927,12 @@ where
     }
 }
 
-/// Combined gRPC service that routes between `OpenShell` and Inference services
-/// based on the request path prefix.
-#[derive(Clone)]
-pub struct GrpcRouter<N, I> {
-    openshell: N,
-    inference: I,
-}
-
-impl<N, I> GrpcRouter<N, I> {
-    fn new(openshell: N, inference: I) -> Self {
-        Self {
-            openshell,
-            inference,
-        }
-    }
-}
-
-const INFERENCE_PATH_PREFIX: &str = "/openshell.inference.v1.Inference/";
-
-impl<N, I, B> tower::Service<Request<B>> for GrpcRouter<N, I>
-where
-    N: tower::Service<Request<B>> + Clone + Send + 'static,
-    N::Response: Send,
-    N::Future: Send,
-    N::Error: Send,
-    I: tower::Service<Request<B>, Response = N::Response, Error = N::Error>
-        + Clone
-        + Send
-        + 'static,
-    I::Future: Send,
-    B: Send + 'static,
-{
-    type Response = N::Response;
-    type Error = N::Error;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
-
-    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn call(&mut self, req: Request<B>) -> Self::Future {
-        let is_inference = req.uri().path().starts_with(INFERENCE_PATH_PREFIX);
-
-        if is_inference {
-            let mut svc = self.inference.clone();
-            Box::pin(async move { svc.ready().await?.call(req).await })
-        } else {
-            let mut svc = self.openshell.clone();
-            Box::pin(async move { svc.ready().await?.call(req).await })
-        }
-    }
-}
-
 /// Assemble the authenticator chain for the gateway.
 ///
 /// Chain order (first-match-wins):
-/// 1. `K8sServiceAccountAuthenticator` (path-scoped to `IssueSandboxToken`)
-///    — exchanges a projected SA token for a `Principal::Sandbox` so the
-///    `IssueSandboxToken` handler can mint a gateway JWT. No-op on every
-///    other path; only present when the gateway runs in-cluster.
+/// 1. `ComputeDriverAuthenticator` (path-scoped to `IssueSandboxToken`)
+///    — delegates a driver-native credential and receives a sandbox identity
+///    so the handler can mint a gateway JWT. No-op on every other path.
 /// 2. `SandboxJwtAuthenticator` — validates gateway-minted JWTs. Recognized
 ///    via a distinctive `kid` so non-matching Bearer tokens fall through.
 /// 3. `OidcAuthenticator` — validates user Bearer tokens against the
@@ -997,8 +950,16 @@ where
 /// to pass-through unless mTLS or local unauthenticated users are enabled.
 fn build_authenticator_chain(state: &ServerState) -> Option<AuthenticatorChain> {
     let mut authenticators: Vec<Arc<dyn crate::auth::authenticator::Authenticator>> = Vec::new();
-    if let Some(k8s) = state.k8s_sa_authenticator.clone() {
-        authenticators.push(k8s);
+    if let Some(driver) = state.compute_driver_authenticator.clone() {
+        authenticators.push(driver);
+    }
+    if let Some(authority) = state.sandbox_session_jwt_authority.clone() {
+        authenticators.push(Arc::new(
+            crate::auth::sandbox_jwt::SandboxSessionJwtAuthenticator::new(
+                authority,
+                state.store.clone(),
+            ),
+        ));
     }
     if let Some(jwt) = state.sandbox_jwt_authenticator.clone() {
         authenticators.push(jwt);
@@ -1489,7 +1450,6 @@ mod tests {
             "/openshell.v1.OpenShell/GetSandboxProviderEnvironment",
             "/openshell.v1.OpenShell/SubmitPolicyAnalysis",
             "/openshell.v1.OpenShell/RefreshSandboxToken",
-            "/openshell.inference.v1.Inference/GetInferenceBundle",
         ];
 
         for path in callback_paths {
@@ -1522,8 +1482,6 @@ mod tests {
             "/openshell.v1.OpenShell/ListSandboxes",
             "/openshell.v1.OpenShell/DeleteSandbox",
             "/openshell.v1.OpenShell/CreateProvider",
-            "/openshell.inference.v1.Inference/GetInferenceRoute",
-            "/openshell.inference.v1.Inference/SetInferenceRoute",
         ];
 
         for path in rejected_grpc_paths {
@@ -1542,7 +1500,6 @@ mod tests {
         let paths = [
             "/grpc.health.v1.Health/Check",
             "/openshell.v1.OpenShell/ListSandboxes",
-            "/openshell.inference.v1.Inference/GetInferenceRoute",
             "/health",
             "/service",
         ];
@@ -1804,7 +1761,9 @@ mod tests {
                 )]),
                 ..Default::default()
             }),
-            workspace: "default".to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                "default".to_string(),
+            )),
             ..Default::default()
         };
         let authed = crate::grpc::test_support::authed_request(());
@@ -1906,6 +1865,196 @@ mod tests {
         let collected = response.into_body().collect().await.unwrap();
         assert_eq!(collected.to_bytes(), committed_body);
         interceptor_task.abort();
+    }
+
+    #[derive(Clone, Default)]
+    struct ReplayTestInterceptor {
+        modifications: Arc<AtomicUsize>,
+        validations: Arc<AtomicUsize>,
+        observations: Arc<AtomicUsize>,
+        deny: Arc<std::sync::atomic::AtomicBool>,
+        name: Arc<Mutex<String>>,
+    }
+
+    #[tonic::async_trait]
+    impl GatewayInterceptor for ReplayTestInterceptor {
+        async fn describe(
+            &self,
+            request: tonic::Request<DescribeRequest>,
+        ) -> Result<tonic::Response<InterceptorManifest>, tonic::Status> {
+            let mut manifest = PostCommitTestInterceptor
+                .describe(request)
+                .await?
+                .into_inner();
+            manifest.bindings.push(InterceptorBinding {
+                id: "validate-create".into(),
+                selector: manifest.bindings[0].selector.clone(),
+                phases: vec![
+                    GatewayInterceptorPhase::ModifyOperation.into(),
+                    GatewayInterceptorPhase::Validate.into(),
+                ],
+                failure_policy: "fail_closed".into(),
+            });
+            Ok(tonic::Response::new(manifest))
+        }
+
+        async fn evaluate(
+            &self,
+            request: tonic::Request<InterceptorEvaluation>,
+        ) -> Result<tonic::Response<InterceptorResult>, tonic::Status> {
+            use openshell_core::proto::gateway_interceptor::v1::{
+                JsonPatch, interceptor_evaluation::Phase,
+            };
+            let mut result = InterceptorResult {
+                allowed: true,
+                ..Default::default()
+            };
+            match request.into_inner().phase.unwrap() {
+                Phase::ModifyOperation(_) => {
+                    self.modifications.fetch_add(1, Ordering::SeqCst);
+                    result.patches.push(JsonPatch {
+                        op: "replace".into(),
+                        path: "/name".into(),
+                        value: Some(prost_types::Value {
+                            kind: Some(prost_types::value::Kind::StringValue(
+                                self.name.lock().unwrap().clone(),
+                            )),
+                        }),
+                        ..Default::default()
+                    });
+                }
+                Phase::Validate(_) => {
+                    self.validations.fetch_add(1, Ordering::SeqCst);
+                    result.allowed = !self.deny.load(Ordering::SeqCst);
+                    result.reason = "current policy denies creation".into();
+                    result.status_code = "PERMISSION_DENIED".into();
+                }
+                Phase::PostCommit(_) => {
+                    self.observations.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            Ok(tonic::Response::new(result))
+        }
+
+        async fn snapshot_provider_profiles(
+            &self,
+            request: tonic::Request<ProviderProfileSnapshotRequest>,
+        ) -> Result<tonic::Response<ProviderProfileSnapshot>, tonic::Status> {
+            PostCommitTestInterceptor
+                .snapshot_provider_profiles(request)
+                .await
+        }
+    }
+
+    #[tokio::test]
+    async fn mutation_replay_revalidates_interceptors_and_observes_commit_once() {
+        use openshell_core::proto::{
+            SandboxResponse, SandboxSpec, open_shell_server::OpenShellServer,
+        };
+        let interceptor = ReplayTestInterceptor::default();
+        *interceptor.name.lock().unwrap() = "intercepted-create".into();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let service = interceptor.clone();
+        let task = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(GatewayInterceptorServer::new(service))
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        let runtime = openshell_gateway_interceptors::initialize(vec![GatewayInterceptorConfig {
+            name: "post-commit-test".into(),
+            grpc_endpoint: format!("http://{address}"),
+            ..Default::default()
+        }])
+        .await
+        .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let key = directory.path().join("key");
+        std::fs::write(&key, b"test-only-private-key").unwrap();
+        let mut state = crate::grpc::test_support::test_server_state().await;
+        Arc::get_mut(&mut state).unwrap().config.gateway_jwt =
+            Some(openshell_core::config::GatewayJwtConfig {
+                signing_key_path: key,
+                public_key_path: directory.path().join("public"),
+                kid_path: directory.path().join("kid"),
+                gateway_id: "test".into(),
+                ttl_secs: None,
+            });
+        let inner = OpenShellServer::new(OpenShellService::new(state.clone()));
+        let mut service = GatewayInterceptorGrpcService::new(inner, runtime, Some(state));
+        let input = CreateSandboxRequest {
+            name: "client-original".into(),
+            request_id: uuid::Uuid::new_v4().to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+            spec: Some(SandboxSpec::default()),
+            ..Default::default()
+        };
+        let request = || {
+            let principal = crate::grpc::test_support::authed_request(())
+                .extensions()
+                .get::<Principal>()
+                .unwrap()
+                .clone();
+            Request::builder()
+                .uri("/openshell.v1.OpenShell/CreateSandbox")
+                .header("content-type", "application/grpc")
+                .header("openshell-replayed", "true")
+                .extension(principal)
+                .body(boxed_body_from_bytes(grpc_frame(&input.encode_to_vec())))
+                .unwrap()
+        };
+        let first = service
+            .ready()
+            .await
+            .unwrap()
+            .call(request())
+            .await
+            .unwrap();
+        assert!(!first.headers().contains_key("openshell-replayed"));
+        let first = first.into_body().collect().await.unwrap();
+        assert_eq!(first.trailers().unwrap().get("grpc-status").unwrap(), "0");
+        let first = decode_unary_grpc_message::<SandboxResponse>(&first.to_bytes()).unwrap();
+        assert_eq!(
+            first
+                .sandbox
+                .as_ref()
+                .unwrap()
+                .metadata
+                .as_ref()
+                .unwrap()
+                .name,
+            "intercepted-create"
+        );
+        let replay = service
+            .ready()
+            .await
+            .unwrap()
+            .call(request())
+            .await
+            .unwrap();
+        assert_eq!(replay.headers().get("openshell-replayed").unwrap(), "true");
+        let replay = replay.into_body().collect().await.unwrap();
+        assert_eq!(
+            decode_unary_grpc_message::<SandboxResponse>(&replay.to_bytes()).unwrap(),
+            first
+        );
+        assert_eq!(interceptor.modifications.load(Ordering::SeqCst), 2);
+        assert_eq!(interceptor.validations.load(Ordering::SeqCst), 2);
+        assert_eq!(interceptor.observations.load(Ordering::SeqCst), 1);
+        interceptor.deny.store(true, Ordering::SeqCst);
+        let denied = service
+            .ready()
+            .await
+            .unwrap()
+            .call(request())
+            .await
+            .unwrap();
+        assert_eq!(denied.headers().get("grpc-status").unwrap(), "7");
+        assert_eq!(interceptor.validations.load(Ordering::SeqCst), 3);
+        assert_eq!(interceptor.observations.load(Ordering::SeqCst), 1);
+        task.abort();
     }
 
     #[test]
@@ -2493,7 +2642,6 @@ mod tests {
             "/openshell.v1.OpenShell/CreateSandbox",
             "/openshell.v1.OpenShell/ListSandboxes",
             "/openshell.v1.OpenShell/DeleteSandbox",
-            "/openshell.inference.v1.Inference/GetInferenceBundle",
             "/metrics",
         ];
 
@@ -2516,7 +2664,6 @@ mod tests {
 
         let expected = [
             "GET",
-            "openshell.inference.v1.Inference/GetInferenceBundle",
             "openshell.v1.OpenShell/CreateSandbox",
             "openshell.v1.OpenShell/DeleteSandbox",
             "openshell.v1.OpenShell/ListSandboxes",
@@ -2543,13 +2690,6 @@ mod tests {
             otel_span_name(&http::Method::POST, "/openshell.v1.OpenShell/CreateSandbox"),
             "openshell.v1.OpenShell/CreateSandbox"
         );
-        assert_eq!(
-            otel_span_name(
-                &http::Method::POST,
-                "/openshell.inference.v1.Inference/GetInferenceBundle"
-            ),
-            "openshell.inference.v1.Inference/GetInferenceBundle"
-        );
     }
 
     /// Non-RPC paths use a low-cardinality method-only name because sandbox
@@ -2573,14 +2713,6 @@ mod tests {
         assert_eq!(
             grpc_method_from_path("/openshell.v1.OpenShell/CreateSandbox"),
             "CreateSandbox"
-        );
-    }
-
-    #[test]
-    fn grpc_method_extracts_inference_service() {
-        assert_eq!(
-            grpc_method_from_path("/openshell.inference.v1.Inference/GetInferenceBundle"),
-            "GetInferenceBundle"
         );
     }
 
@@ -2911,27 +3043,6 @@ mod tests {
             ));
         }
 
-        #[tokio::test]
-        async fn sandbox_principal_can_fetch_inference_bundle() {
-            let mock = Arc::new(MockAuthenticator::returning(Ok(Some(sandbox_principal()))));
-            let chain = AuthenticatorChain::new(vec![mock]);
-            let (recorder, seen) = PrincipalRecorder::new();
-            let mut router = AuthGrpcRouter::new(recorder, Some(chain), None);
-
-            let res = router
-                .call(empty_request(
-                    "/openshell.inference.v1.Inference/GetInferenceBundle",
-                ))
-                .await
-                .unwrap();
-
-            assert_eq!(res.status(), 200);
-            assert!(matches!(
-                seen.lock().unwrap().as_ref(),
-                Some(Principal::Sandbox(_))
-            ));
-        }
-
         /// A user principal — even one carrying `openshell:all` and the
         /// admin role — must not reach a `sandbox`-annotated method. The
         /// router enforces this from the per-handler auth-mode declarations
@@ -2965,7 +3076,6 @@ mod tests {
                 "/openshell.v1.OpenShell/RelayStream",
                 "/openshell.v1.OpenShell/IssueSandboxToken",
                 "/openshell.v1.OpenShell/RefreshSandboxToken",
-                "/openshell.inference.v1.Inference/GetInferenceBundle",
             ] {
                 let mock = Arc::new(MockAuthenticator::returning(Ok(Some(admin_user()))));
                 let chain = AuthenticatorChain::new(vec![mock]);
@@ -3022,8 +3132,6 @@ mod tests {
                 "/openshell.v1.OpenShell/DeleteSandbox",
                 "/openshell.v1.OpenShell/CreateProvider",
                 "/openshell.v1.OpenShell/ApproveDraftChunk",
-                "/openshell.inference.v1.Inference/GetInferenceRoute",
-                "/openshell.inference.v1.Inference/SetInferenceRoute",
             ] {
                 let mock = Arc::new(MockAuthenticator::returning(Ok(Some(sandbox_principal()))));
                 let chain = AuthenticatorChain::new(vec![mock]);

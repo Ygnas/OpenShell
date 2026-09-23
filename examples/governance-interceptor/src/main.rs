@@ -10,9 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use jsonwebtoken::{
-    Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, decode_header, encode,
-};
+use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode_header};
 use openshell_core::proto::gateway_interceptor::v1::{
     DescribeRequest, GatewayInterceptorPhase, InterceptorBinding, InterceptorEvaluation,
     InterceptorManifest, InterceptorResult, InterceptorSelector, JsonPatch,
@@ -24,6 +22,7 @@ use openshell_core::proto::{
     ListSandboxesRequest, ProviderProfile, Sandbox, SandboxPhase, SandboxPolicy,
     UpdateConfigRequest, open_shell_client::OpenShellClient,
 };
+use openshell_crypto::jwt::{decode, encode};
 use openshell_policy::parse_sandbox_policy;
 use openshell_providers::{ProviderTypeProfile, normalize_profile_id};
 use policy_hash::{
@@ -34,10 +33,8 @@ use prost::Message as _;
 use prost_types::ListValue;
 use prost_types::{Struct, Value as ProtoValue, value::Kind};
 use proto_json::{decode_message_to_json, encode_json_to_message};
-use rcgen::{KeyPair, PKCS_ED25519};
 use serde::{Deserialize, Serialize};
 use serde_json::{Number, Value, json};
-use sha2::{Digest, Sha256};
 use tonic::Code;
 use tonic::transport::{Channel, Server};
 use tonic::{Request, Response, Status};
@@ -101,15 +98,17 @@ struct ProfileSignatureClaims {
 
 impl PolicySigner {
     fn generate() -> Result<Self, String> {
-        let keypair = KeyPair::generate_for(&PKCS_ED25519)
+        let keypair = openshell_crypto::pki::generate_jwt_keypair()
             .map_err(|err| format!("failed to generate policy signing key: {err}"))?;
-        let signing_key_pem = keypair.serialize_pem();
+        let signing_key_pem = keypair
+            .serialize_pem()
+            .map_err(|error| format!("export signing key: {error}"))?;
         let public_key_pem = keypair.public_key_pem();
         let encoding_key = EncodingKey::from_ed_pem(signing_key_pem.as_bytes())
             .map_err(|err| format!("failed to parse policy signing key: {err}"))?;
         let decoding_key = DecodingKey::from_ed_pem(public_key_pem.as_bytes())
             .map_err(|err| format!("failed to parse policy verification key: {err}"))?;
-        let kid = kid_from_public_key_der(&keypair.public_key_der());
+        let kid = kid_from_public_key_der(&keypair.public_key_der())?;
         Ok(Self {
             encoding_key,
             decoding_key,
@@ -863,11 +862,8 @@ fn load_provider_profile_source(
     let mapping = value
         .as_mapping_mut()
         .ok_or_else(|| format!("provider profile {source} must be a YAML mapping"))?;
-    mapping.insert(
-        serde_yml::Value::String("id".to_string()),
-        serde_yml::Value::String(profile_id.to_string()),
-    );
-    let profile = serde_yml::from_value::<ProviderTypeProfile>(value)
+    mapping.insert("id", serde_yml::Value::String(profile_id.to_string()));
+    let profile = serde_yml::from_value::<ProviderTypeProfile>(&value)
         .map_err(|err| format!("failed to decode provider profile {source}: {err}"))?
         .to_proto();
     Ok(LoadedProviderProfile { profile })
@@ -1048,9 +1044,9 @@ fn normalize_for_struct(value: Value) -> Result<Value, String> {
     json_to_proto_value(&value).map(|value| proto_value_to_json(&value))
 }
 
-fn kid_from_public_key_der(public_key_der: &[u8]) -> String {
-    let digest = Sha256::digest(public_key_der);
-    hex_encode_prefix(&digest, 16)
+fn kid_from_public_key_der(public_key_der: &[u8]) -> Result<String, String> {
+    let digest = openshell_crypto::sha256(public_key_der).map_err(|error| error.to_string())?;
+    Ok(hex_encode_prefix(&digest, 16))
 }
 
 fn hex_encode_prefix(bytes: &[u8], n: usize) -> String {
@@ -1227,22 +1223,20 @@ async fn propagate_policy_to_running_sandboxes(
         .await
         .map_err(|err| format!("connect to gateway {gateway_endpoint} failed: {err}"))?;
     let mut client = OpenShellClient::new(channel);
-    let mut offset = 0_u32;
-    let limit = 100_u32;
+    let mut page_token = String::new();
     let correlation_id = format!("{}:{}", RELOAD_CORRELATION_PREFIX, now_secs());
     loop {
         let response = client
             .list_sandboxes(ListSandboxesRequest {
-                limit,
-                offset,
+                page_size: 100,
+                page_token,
                 label_selector: String::new(),
-                workspace: String::new(),
-                all_workspaces: true,
+                workspace_scope: Some(openshell_core::proto::all_workspaces_selector()),
             })
             .await
             .map_err(|status| format!("list sandboxes failed: {status}"))?
             .into_inner();
-        let count = response.sandboxes.len();
+        let next_page_token = response.next_page_token;
         for sandbox in response.sandboxes {
             if !sandbox_accepts_policy_reload(&sandbox) {
                 continue;
@@ -1260,6 +1254,7 @@ async fn propagate_policy_to_running_sandboxes(
                     policy: Some(policy_state.policy_proto.clone()),
                     annotations: policy_update_annotations(policy_state, &correlation_id),
                     expected_resource_version: resource_version,
+                    workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                     ..Default::default()
                 })
                 .await;
@@ -1282,10 +1277,10 @@ async fn propagate_policy_to_running_sandboxes(
                 }
             }
         }
-        if count < usize::try_from(limit).unwrap_or(usize::MAX) {
+        if next_page_token.is_empty() {
             break;
         }
-        offset = offset.saturating_add(limit);
+        page_token = next_page_token;
     }
     Ok(())
 }

@@ -312,6 +312,7 @@ mod tests {
     }
 
     fn test_client() -> reqwest::Client {
+        openshell_crypto::tls::ensure_default_provider();
         reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(5))
             .no_proxy()

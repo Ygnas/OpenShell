@@ -10,7 +10,12 @@ OpenShell is built agent-first. We design systems and use agents to implement th
 
 ## Skills
 
-Agent skills live in `.agents/skills/`. Your harness can discover and load them natively — do not rely on this file for a full inventory. The detailed skills table is in [CONTRIBUTING.md](CONTRIBUTING.md) (for humans).
+OpenShell has two skill collections:
+
+- `skills/` contains public, installable skills for using and operating OpenShell. These skills must work outside a source checkout and use installed CLI help plus published documentation as their sources of truth.
+- `.agents/skills/` contains internal contributor and maintainer workflows for developing OpenShell. Your repository-aware harness can discover and load them natively.
+
+Do not rely on this file for a full inventory. The detailed public and contributor skill tables are in [CONTRIBUTING.md](CONTRIBUTING.md) (for humans).
 
 ## Workflow Chains
 
@@ -30,17 +35,25 @@ These pipelines connect skills into end-to-end workflows. Individual skill files
 | Path | Components | Purpose |
 |------|-----------|---------|
 | `crates/openshell-cli/` | CLI binary | User-facing command-line interface |
+| `crates/openshell-conformance/` | CLI conformance library | Reusable driver-agnostic scenarios and command runner |
+| `crates/openshell-conformance-cli/` | Conformance CLI | Distributable `list` and `run` entrypoint for gateway conformance |
 | `crates/openshell-server/` | Gateway server | Control-plane API, sandbox lifecycle, auth boundary |
-| `crates/openshell-sandbox/` | Sandbox runtime | Container supervision, policy-enforced egress routing |
-| `crates/openshell-policy/` | Policy engine | Filesystem, network, process, and inference constraints |
-| `crates/openshell-router/` | Privacy router | Privacy-aware LLM routing |
+| `crates/openshell-sandbox/` | Sandbox runtime | Capability-free workload launcher, process identity, and seccomp-mediated I/O |
+| `crates/openshell-supervisor/` | Supervisor runtime | Gateway session, policy evaluation, credentials, and upstream networking |
+| `crates/openshell-binary-identity/` | Binary identity | Shared trusted procfs executable identity resolution for isolation backends |
+| `crates/openshell-isolation-interface/` | Isolation backend interface | RFC 0012 `IsolationBackend` trait and types; the supervisor-facing runtime contract |
+| `crates/openshell-sandbox-backend/` | OpenShell sandbox backend | `OpenShellRuntimeBackend` and the authenticated OpenShell Sandbox Protocol shared with `openshell-sandbox` |
+| `crates/openshell-policy/` | Policy engine | Filesystem, network, and process constraints |
+| `crates/openshell-policy-schema/` | Authored policy schema | Dependency-light YAML/JSON representation, bounded parsing, and pure authored-language semantics |
 | `crates/openshell-bootstrap/` | Gateway metadata | Gateway registration metadata, auth token storage, mTLS bundle storage |
 | `crates/openshell-gateway-interceptors/` | Gateway interceptors | Intercepts and transforms configured gRPC requests at the gateway routing boundary |
-| `crates/openshell-ocsf/` | OCSF logging | OCSF v1.7.0 event types, builders, shorthand/JSONL formatters, tracing layers |
+| `crates/openshell-ocsf/` | OCSF logging | OCSF v1.8.0 event types, builders, shorthand/JSONL formatters, tracing layers |
 | `crates/openshell-otel/` | OpenTelemetry support | Shared OTLP trace provider, resource, and tracing-layer construction |
 | `crates/openshell-otel-test-support/` | OpenTelemetry test support | Shared loopback OTLP collector fixture for tracing tests |
+| `crates/openshell-crypto/` | Crypto backend | Backend-neutral primitives and TLS, PKI, JWT adapters; AWS-LC implementation |
 | `crates/openshell-core/` | Shared core | Common types, configuration, error handling |
 | `crates/openshell-extension-core/` | Extension core | Shared extension identity, JWT claims, bearer-token rotation, and TLS transport primitives |
+| `crates/openshell-gateway/` | Gateway binary composition | Links selected first-party compute drivers into the backend-agnostic server registry |
 | `crates/openshell-sdk/` | Shared client SDK | Async Rust gateway client (gRPC transport, TLS, OIDC refresh, edge tunnel); consumed by CLI, TUI, and `@openshell/sdk` |
 | `crates/openshell-providers/` | Provider management | Credential provider backends |
 | `crates/openshell-tui/` | Terminal UI | Ratatui-based dashboard for monitoring |
@@ -51,11 +64,13 @@ These pipelines connect skills into end-to-end workflows. Individual skill files
 | `crates/openshell-driver-docker/` | Docker compute driver | In-process `ComputeDriver` backend for local Docker sandbox containers |
 | `crates/openshell-driver-podman/` | Podman compute driver | In-process `ComputeDriver` backend for local Podman sandbox containers |
 | `crates/openshell-driver-vm/` | VM compute driver | Standalone libkrun-backed `ComputeDriver` subprocess (embeds its own rootfs + runtime) |
+| `crates/openshell-driver-mxc/` | Microsoft MXC compute driver | In-process Windows AppContainer and isolation-session compute backend |
 | `crates/openshell-prover/` | Policy prover | Policy verification and proof generation |
+| `crates/openshell-prover-cli/` | Policy prover CLI | Standalone local policy boundary checks |
 | `crates/openshell-server-macros/` | Server macros | Compile-time helpers for gateway RPC authorization |
 | `crates/openshell-supervisor-middleware/` | Middleware runtime | Generic middleware registry, remote service integration, and chain execution |
 | `crates/openshell-supervisor-middleware-builtins/` | Built-in middleware | First-party in-process middleware implementations |
-| `crates/openshell-supervisor-network/` | Network supervisor | Proxying, L7 enforcement, policy evaluation, and inference routing |
+| `crates/openshell-supervisor-network/` | Network supervisor | Proxying, L7 enforcement, policy evaluation, and provider credential injection |
 | `crates/openshell-supervisor-process/` | Process supervisor | Process lifecycle, namespace, and bypass monitoring |
 | `crates/openshell-vfio/` | VFIO support | PCI and GPU passthrough preparation and lifecycle |
 | `python/openshell/` | Python SDK | Python bindings and CLI packaging |
@@ -64,7 +79,8 @@ These pipelines connect skills into end-to-end workflows. Individual skill files
 | `deploy/` | Docker, Helm, K8s | Dockerfiles, Helm chart, manifests |
 | `docs/` | Published docs | MDX pages, navigation, and content assets |
 | `fern/` | Docs site config | Fern site config, components, and theme assets |
-| `.agents/skills/` | Agent skills | Workflow automation for development |
+| `skills/` | Public agent skills | Installable workflows for using and operating OpenShell |
+| `.agents/skills/` | Contributor agent skills | Repository-aware workflows for developing OpenShell |
 | `.agents/agents/` | Agent personas | Sub-agent definitions (e.g., reviewer, doc writer) |
 | `architecture/` | Architecture docs | Design decisions and component documentation |
 
@@ -105,7 +121,7 @@ Use an OCSF builder + `ocsf_emit!()` for events that represent **observable sand
 - SSH authentication (accepted, denied, nonce replay)
 - Process lifecycle (start, exit, timeout, signal failure)
 - Security findings (unsafe policy, unavailable controls, replay attacks)
-- Configuration changes (policy load/reload, TLS setup, inference routes, settings)
+- Configuration changes (policy load/reload, TLS setup, provider attachments, settings)
 - Application lifecycle (supervisor start, SSH server ready)
 
 ### When to use plain tracing
@@ -127,7 +143,7 @@ Use `info!()`, `debug!()`, `warn!()` for **internal operational plumbing** that 
 | SSH sessions | `SshActivityBuilder` | Authentication, channel operations |
 | Process start/stop | `ProcessActivityBuilder` | Entrypoint lifecycle, signal failures |
 | Security alerts | `DetectionFindingBuilder` | Nonce replay, bypass detection, unsafe policy. Dual-emit with the domain event. |
-| Policy/config changes | `ConfigStateChangeBuilder` | Policy load, Landlock apply, TLS setup, inference routes, settings |
+| Policy/config changes | `ConfigStateChangeBuilder` | Policy load, Landlock apply, TLS setup, provider attachments, settings |
 | Supervisor lifecycle | `AppLifecycleBuilder` | Sandbox start, SSH server ready/failed |
 
 ### Severity guidelines
@@ -164,7 +180,7 @@ ocsf_emit!(event);
 
 ### Key points
 
-- `crate::ocsf_ctx()` returns the process-wide `SandboxContext`. It is always available (falls back to defaults in tests).
+- `crate::ocsf_ctx()` returns the process-wide `EventContext`. It is always available (falls back to defaults in tests).
 - `ocsf_emit!()` is non-blocking and cannot panic. It stores the event in a thread-local and emits via `tracing::info!()`.
 - The shorthand layer and JSONL layer extract the event from the thread-local. The shorthand format is derived automatically from the builder fields.
 - For security findings, **dual-emit**: one domain event (e.g., `SshActivityBuilder`) AND one `DetectionFindingBuilder` for the same incident.
@@ -235,7 +251,7 @@ ocsf_emit!(event);
 
 ## Cluster Infrastructure Changes
 
-- If you change gateway deployment infrastructure (e.g., Helm values/templates, gateway image packaging, or deploy logic in `openshell-cli`), update the `debug-openshell-cluster` skill in `.agents/skills/debug-openshell-cluster/SKILL.md` to reflect those changes.
+- If you change gateway deployment infrastructure (e.g., Helm values/templates, gateway image packaging, or deploy logic in `openshell-cli`), update the `debug-openshell-cluster` skill in `skills/debug-openshell-cluster/SKILL.md` to reflect those changes.
 
 ## Skill Maintenance
 
@@ -246,10 +262,10 @@ When behavior, commands, or development workflows change, review the related age
 - When making changes, update the relevant documentation in the `architecture/` directory.
 - When changes affect user-facing behavior, update the relevant published docs pages under `docs/` and navigation in `docs/index.yml`.
 - When changing gateway TOML fields, driver-specific config options, config defaults, or Helm rendering of `gateway.toml`, update `docs/reference/gateway-config.mdx` in the same branch.
-- `fern/` contains the Fern site config, components, preview workflow inputs, and publish settings.
+- `fern/` contains the Fern site config, components, preview workflow inputs, publish settings, and publishing documentation in `fern/README.md`.
 - Follow the docs style guide in [docs/CONTRIBUTING.mdx](docs/CONTRIBUTING.mdx): active voice, minimal formatting, no filler introductions, `shell` fences for copyable commands, and no duplicate body H1.
-- Fern PR previews run through `.github/workflows/branch-docs.yml`, and production publish runs through the `publish-fern-docs` job in `.github/workflows/release-tag.yml`.
-- Use the `update-docs` skill to scan recent commits and draft doc updates.
+- Fern PR previews run through `.github/workflows/branch-docs.yml`. Release Dev publishes `dev`, and Release Tag publishes an immutable stable version plus `latest`. Both production paths call `.github/workflows/sync-docs.yml` once.
+- Use the `update-docs-from-commits` skill to scan recent commits and draft doc updates.
 
 ### Architecture Docs
 

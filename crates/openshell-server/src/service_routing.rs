@@ -13,9 +13,9 @@ use openshell_core::config::ServiceRoutingConfig;
 use openshell_core::proto::{Sandbox, SandboxPhase, ServiceEndpoint, TcpRelayTarget, relay_open};
 use openshell_core::{ObjectId, VERSION};
 use openshell_ocsf::{
-    ActionId, ActivityId, ConfigStateChangeBuilder, DispositionId, Endpoint, HttpActivityBuilder,
-    HttpRequest, HttpResponse as OcsfHttpResponse, NetworkActivityBuilder, OCSF_TARGET, OcsfEvent,
-    SandboxContext, SeverityId, StateId, StatusId, Url as OcsfUrl,
+    ActionId, ActivityId, ConfigStateChangeBuilder, DispositionId, Endpoint, EventContext,
+    HttpActivityBuilder, HttpRequest, HttpResponse as OcsfHttpResponse, NetworkActivityBuilder,
+    OCSF_TARGET, OcsfEvent, SeverityId, StateId, StatusId, Url as OcsfUrl,
 };
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
@@ -760,8 +760,8 @@ fn emit_gateway_ocsf_event(sandbox_id: &str, event: OcsfEvent) {
     );
 }
 
-fn gateway_ocsf_ctx(sandbox_id: &str, sandbox_name: &str) -> SandboxContext {
-    SandboxContext {
+fn gateway_ocsf_ctx(sandbox_id: &str, sandbox_name: &str) -> EventContext {
+    EventContext {
         sandbox_id: sandbox_id.to_string(),
         sandbox_name: sandbox_name.to_string(),
         container_image: "openshell/gateway".to_string(),
@@ -825,12 +825,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "endpoint-id".to_string(),
                 name: "my-sandbox--web".to_string(),
-                created_at_ms: 1_700_000_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_700_000_000_000).ok(),
                 labels: std::collections::HashMap::default(),
                 resource_version: 0,
                 annotations: std::collections::HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             sandbox_id: "sandbox-id".to_string(),
             sandbox_name: "my-sandbox".to_string(),
@@ -1210,12 +1210,12 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "ep-1".to_string(),
                 name: "my-sandbox--web".to_string(),
-                created_at_ms: 1_700_000_000_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_700_000_000_000).ok(),
                 labels: std::collections::HashMap::default(),
                 resource_version: 0,
                 annotations: std::collections::HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             sandbox_id: "sandbox-1".to_string(),
             sandbox_name: "my-sandbox".to_string(),

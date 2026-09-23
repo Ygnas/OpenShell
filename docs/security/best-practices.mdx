@@ -9,7 +9,7 @@ keywords: "Generative AI, Cybersecurity, Security, Policy, Sandbox, Landlock, Se
 position: 1
 ---
 
-OpenShell enforces sandbox security across four layers: network, filesystem, process, and inference.
+OpenShell enforces sandbox security across four layers: network, filesystem, process, and provider credentials.
 This page documents every configurable control, its default, what it protects, and the risk of relaxing it.
 
 For the full policy YAML schema, refer to the [Policy Schema](/reference/policy-schema).
@@ -31,7 +31,7 @@ You can update dynamic controls on a running sandbox with `openshell policy upda
 | Network | Unauthorized outbound connections and data exfiltration. | CONNECT proxy + OPA policy engine | Yes. Use `openshell policy update`, `openshell policy set`, or operator approval in the TUI. |
 | Filesystem | System binary tampering, credential theft, config manipulation. | Landlock LSM (kernel level) | No. Requires sandbox re-creation. |
 | Process | Privilege escalation, fork bombs, dangerous syscalls. | Seccomp BPF + privilege drop (`setuid`/`setgid`) | No. Requires sandbox re-creation. |
-| Inference | Credential exposure, unauthorized model access. | Proxy intercept of `inference.local` | Yes. Use `openshell inference set`. |
+| Provider credentials | Credential exposure and unauthorized service access. | Network policy plus profile endpoint binding and proxy substitution | Yes. Attach or detach providers and update dynamic policy. |
 
 ## Network Controls
 
@@ -71,7 +71,7 @@ This provides defense-in-depth: even if a container escape vulnerability exists,
 
 | Aspect | Detail |
 |---|---|
-| Default | Disabled. Set `server.enableUserNamespaces: true` in Helm values or `enable_user_namespaces = true` in the gateway config to enable cluster-wide. |
+| Default | Disabled. Set `server.enableUserNamespaces: true` in Helm values or `enable_user_namespaces = true` in `[openshell.drivers.kubernetes]` to enable cluster-wide. |
 | What you can change | Enable cluster-wide through Helm or gateway config. Override per-sandbox through the `user_namespaces` field on `SandboxTemplate` in the API. |
 | Prerequisites | Kubernetes 1.33+ with user namespace support available (beta through 1.35, GA in 1.36+), a container runtime that supports user namespaces (containerd 2.0+, CRI-O 1.25+), and Linux 5.12+ for ID-mapped mounts. |
 | Risk if enabled with GPU | NVIDIA device plugin compatibility with user namespaces is unverified. OpenShell logs a warning when both GPU and user namespaces are active on the same sandbox. |
@@ -159,14 +159,20 @@ Paths listed in `read_only` receive read-only access.
 Paths listed in `read_write` receive full access.
 All other paths are inaccessible.
 
-Landlock setup runs in two phases. The parent supervisor probes the kernel ABI and opens the configured path file descriptors before forking. The child then applies the ruleset with `restrict_self()` after privilege drop. At startup, OpenShell emits the selected ABI version and the applied read-only and read-write rule counts so you can confirm what the kernel accepted.
+The sandbox installs a mandatory Landlock baseline before running agent code.
+It requires ABI 3 or newer, introduced in Linux 6.2, so denied writes include
+file truncation. The baseline hides the private channel and bootstrap root from
+the agent by granting access only to explicitly opened, permitted root children;
+it never grants the filesystem root or follows a root-level symlink when
+constructing that allowlist. Startup fails if this baseline cannot be enforced.
+The configured filesystem policy adds restrictions on top of the baseline.
 
 | Aspect | Detail |
 |---|---|
-| Default | `compatibility: best_effort`. Uses the highest kernel ABI available. Missing paths are skipped. If the kernel does not support Landlock or any configured path cannot be opened, the sandbox continues without those restrictions and emits a High-severity OCSF `DetectionFinding`. |
-| What you can change | Set `compatibility: hard_requirement` to abort sandbox startup if Landlock is unavailable or any configured path cannot be opened. |
-| Risk if relaxed | On kernels without Landlock (pre-5.13), or when all paths fail to open, the sandbox runs without kernel-level filesystem restrictions. The agent can access any file the process user can access. |
-| Recommendation | Use `best_effort` for development. Use `hard_requirement` in environments where any gap in filesystem isolation is unacceptable. Treat High-severity Landlock findings as a signal to investigate the host kernel or the image. Run on Ubuntu 22.04+ or any kernel 5.13+ for Landlock support. |
+| Default | The mandatory baseline always requires Landlock ABI 3 or newer. The additional filesystem policy defaults to `compatibility: best_effort`, which may skip unavailable policy paths and emits a High-severity OCSF `DetectionFinding` when that policy cannot be fully applied. |
+| What you can change | Set `compatibility: hard_requirement` to reject startup when the additional filesystem policy cannot be applied. Neither setting relaxes the private-file baseline. |
+| Risk if relaxed | A skipped additional policy can expose otherwise permitted image or workspace files to the agent. It cannot grant access to files excluded by the mandatory baseline. |
+| Recommendation | Require Linux 6.2 or newer with Landlock enabled, or a qualified distribution backport providing ABI 3. Use `hard_requirement` where all configured filesystem restrictions must apply. Investigate High-severity Landlock findings rather than treating them as a supported degraded security mode. |
 
 ### Read-Only vs Read-Write Paths
 
@@ -233,22 +239,19 @@ This ordering is intentional: named network-namespace setup still relies on priv
 6. Landlock filesystem restrictions.
 7. Runtime seccomp socket domain and syscall filters.
 
-## Inference Controls
+## Provider-backed Inference Controls
 
-OpenShell routes all inference traffic through the gateway to isolate provider credentials from the sandbox.
-
-### Routed Inference through `inference.local`
-
-The proxy intercepts HTTPS CONNECT requests to `inference.local` and routes matching inference API requests through the sandbox-local router.
-The agent never receives the provider API key.
+Inference providers use the same endpoint-bound credential mechanism as other
+providers. Attach a profile-backed provider only to sandboxes that need it.
+The agent receives an opaque placeholder, not the real API key or access token.
 
 | Aspect | Detail |
 |---|---|
-| Default | Always active. The proxy handles `inference.local` before OPA policy evaluation. The gateway injects credentials on the host side. |
-| Keep-alive isolation | If a sandbox reuses a keep-alive connection that previously carried a routed inference request for a subsequent non-inference request, the proxy denies the non-inference request with `connection not allowed by policy` and closes the connection. This prevents agents from reusing an inference-authorized connection for other destinations. |
-| What you can change | Configure inference routes with `openshell inference set`. |
-| Risk if bypassed | If an inference provider's host is added directly to `network_policies`, the agent could reach it with a stolen or hardcoded key, bypassing credential isolation. |
-| Recommendation | Do not add inference provider hosts to `network_policies`. Use OpenShell inference routing instead. |
+| Default | No model-provider access. A sandbox must attach a provider and policy must admit the native endpoint and calling binary. |
+| Credential boundary | The placeholder resolves only for hosts, ports, and paths authorized by the provider profile. |
+| What you can change | Attach or detach providers and adjust the profile or sandbox policy. Model and timeout configuration remain in the native client. |
+| Risk if relaxed | Broad endpoint paths or binary globs can expose more of a provider's API than the workload needs. `allow_uninspected_credentials` removes L7 visibility and should be exceptional. |
+| Recommendation | Use narrow endpoint paths and binaries, inspect the effective policy, and keep credentials in provider records rather than workload environment configuration. |
 
 ## Gateway Security
 

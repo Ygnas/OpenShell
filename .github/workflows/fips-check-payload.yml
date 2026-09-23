@@ -1,0 +1,107 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: FIPS Final Image Scan
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check-payload:
+    name: Build and scan UBI FIPS candidates
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Podman and build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends podman jq binutils
+          podman version
+
+      - name: Install OpenShift client required by check-payload
+        env:
+          OPENSHIFT_CLIENT_VERSION: 4.19.0
+        run: |
+          curl --fail --location --retry 3 \
+            "https://mirror.openshift.com/pub/openshift-v4/clients/ocp/${OPENSHIFT_CLIENT_VERSION}/openshift-client-linux.tar.gz" \
+            --output "${RUNNER_TEMP}/openshift-client.tar.gz"
+          tar -xzf "${RUNNER_TEMP}/openshift-client.tar.gz" -C "${RUNNER_TEMP}" oc
+          sudo install -m 0755 "${RUNNER_TEMP}/oc" /usr/local/bin/oc
+          oc version --client
+
+      - name: Build gateway FIPS candidate image
+        run: |
+          podman build --pull=missing \
+            --file deploy/docker/Dockerfile.fips.gateway \
+            --tag localhost/openshell-gateway:fips-${GITHUB_SHA} .
+
+      - name: Build supervisor FIPS candidate image
+        run: |
+          podman build --pull=missing \
+            --file deploy/docker/Dockerfile.fips.supervisor \
+            --tag localhost/openshell-supervisor:fips-${GITHUB_SHA} .
+
+      - name: Publish candidates to ephemeral local registry
+        run: |
+          podman run --detach --name fips-check-payload-registry \
+            --publish 127.0.0.1:5000:5000 registry:2
+          curl --fail --retry 10 --retry-delay 1 --retry-connrefused \
+            http://127.0.0.1:5000/v2/
+          for image in gateway supervisor; do
+            podman tag "localhost/openshell-${image}:fips-${GITHUB_SHA}" \
+              "127.0.0.1:5000/openshell-${image}:fips-${GITHUB_SHA}"
+            podman push --tls-verify=false \
+              "127.0.0.1:5000/openshell-${image}:fips-${GITHUB_SHA}"
+          done
+
+      - name: Build pinned check-payload scanner
+        env:
+          CHECK_PAYLOAD_REF: a0d24f93afba5041e7761328568eb7f23aff7626
+        run: |
+          git clone https://github.com/openshift/check-payload.git check-payload
+          git -C check-payload checkout --detach "${CHECK_PAYLOAD_REF}"
+          podman run --rm \
+            -v "${PWD}/check-payload:/src:Z" \
+            -w /src \
+            golang:1.26-bookworm \
+            bash -c 'make'
+          install -m 0755 check-payload/check-payload "${RUNNER_TEMP}/check-payload"
+
+      - name: Scan gateway image with check-payload
+        run: |
+          "${RUNNER_TEMP}/check-payload" scan operator \
+            --spec "127.0.0.1:5000/openshell-gateway:fips-${GITHUB_SHA}" \
+            --insecure-pull \
+            --fail-on-warnings \
+            --output-file "${RUNNER_TEMP}/gateway-check-payload.txt"
+
+      - name: Scan supervisor image with check-payload
+        run: |
+          "${RUNNER_TEMP}/check-payload" scan operator \
+            --spec "127.0.0.1:5000/openshell-supervisor:fips-${GITHUB_SHA}" \
+            --insecure-pull \
+            --fail-on-warnings \
+            --output-file "${RUNNER_TEMP}/supervisor-check-payload.txt"
+
+      - name: Upload check-payload reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: check-payload-reports-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/gateway-check-payload.txt
+            ${{ runner.temp }}/supervisor-check-payload.txt
+          if-no-files-found: warn

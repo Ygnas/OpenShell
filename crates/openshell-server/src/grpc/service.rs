@@ -15,8 +15,12 @@ use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
 use crate::ServerState;
-use crate::auth::workspace_authz::{MinWorkspaceRole, authorize_workspace, require_platform_admin};
-use crate::persistence::{ObjectType, WriteCondition};
+use crate::auth::workspace_authz::{
+    AuthorizedWorkspaceScope, MinWorkspaceRole, authorize_list_workspace_selector,
+    authorize_workspace_selector,
+};
+use crate::pagination::Pagination;
+use crate::persistence::{ObjectListQuery, ObjectType, WriteCondition};
 use crate::service_routing;
 
 const MAX_SERVICE_NAME_LEN: usize = super::MAX_ROUTABLE_NAME_LEN;
@@ -28,11 +32,11 @@ pub(super) async fn handle_expose_service(
 ) -> Result<Response<ServiceEndpointResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
-    let authz = authorize_workspace(
+    let authz = authorize_workspace_selector(
         &state.store,
         &state.admin_role,
         &principal,
-        &req.workspace,
+        req.workspace_scope.as_ref(),
         MinWorkspaceRole::User,
     )
     .await?;
@@ -73,7 +77,9 @@ pub(super) async fn handle_expose_service(
             existing
                 .metadata
                 .as_ref()
-                .map_or(now, |metadata| metadata.created_at_ms),
+                .and_then(|metadata| metadata.created_time.as_ref())
+                .and_then(|value| openshell_core::time::timestamp_to_millis(value).ok())
+                .unwrap_or(now),
             WriteCondition::MatchResourceVersion(resource_version),
             false,
         )
@@ -97,12 +103,12 @@ pub(super) async fn handle_expose_service(
         metadata: Some(ObjectMeta {
             id: id.clone(),
             name: key.clone(),
-            created_at_ms,
+            created_time: openshell_core::time::timestamp_from_millis(created_at_ms).ok(),
             labels: HashMap::from([("sandbox".to_string(), req.sandbox.clone())]),
             resource_version: 0,
             annotations: HashMap::new(),
             workspace: workspace.clone(),
-            deletion_timestamp_ms: 0,
+            deletion_time: None,
         }),
         sandbox_id: sandbox.object_id().to_string(),
         sandbox_name: req.sandbox.clone(),
@@ -147,11 +153,11 @@ pub(super) async fn handle_get_service(
 ) -> Result<Response<ServiceEndpointResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
-    let authz = authorize_workspace(
+    let authz = authorize_workspace_selector(
         &state.store,
         &state.admin_role,
         &principal,
-        &req.workspace,
+        req.workspace_scope.as_ref(),
         MinWorkspaceRole::User,
     )
     .await?;
@@ -174,61 +180,71 @@ pub(super) async fn handle_list_services(
 ) -> Result<Response<ListServicesResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
-    if req.all_workspaces && !req.workspace.is_empty() {
-        return Err(Status::invalid_argument(
-            "all_workspaces and workspace are mutually exclusive",
-        ));
-    }
     if !req.sandbox.is_empty() {
         validate_endpoint_name("sandbox", &req.sandbox, MAX_SANDBOX_NAME_LEN)?;
     }
 
-    let limit = super::clamp_limit(req.limit, 100, super::MAX_PAGE_SIZE);
-    let endpoints: Vec<ServiceEndpoint> = if req.all_workspaces {
-        require_platform_admin(&state.admin_role, &principal)?;
+    let scope = authorize_list_workspace_selector(
+        &state.store,
+        &state.admin_role,
+        &principal,
+        req.workspace_scope.as_ref(),
+        MinWorkspaceRole::User,
+    )
+    .await?;
+    let workspace = if matches!(scope, AuthorizedWorkspaceScope::AllWorkspaces) {
         if !req.sandbox.is_empty() {
             return Err(Status::invalid_argument(
                 "sandbox filter is not supported with all_workspaces",
             ));
         }
-        state.store.list_all_messages(limit, req.offset).await
+        None
     } else {
-        let authz = authorize_workspace(
-            &state.store,
-            &state.admin_role,
-            &principal,
-            &req.workspace,
-            MinWorkspaceRole::User,
-        )
-        .await?;
+        let AuthorizedWorkspaceScope::Workspace(authz) = scope else {
+            unreachable!("all-workspaces scope handled above")
+        };
         let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
             .await?
             .name;
-        if req.sandbox.is_empty() {
-            state
-                .store
-                .list_messages(&workspace, limit, req.offset)
-                .await
-        } else {
-            state
-                .store
-                .list_messages_with_selector(
-                    &workspace,
-                    &format!("sandbox={}", req.sandbox),
-                    limit,
-                    req.offset,
-                )
-                .await
+        Some(workspace)
+    };
+    let scope_fingerprint = workspace.as_deref().unwrap_or("*");
+    let pagination = Pagination::new(
+        req.page_size,
+        &req.page_token,
+        "ListServices",
+        &[&req.sandbox, scope_fingerprint],
+    )?;
+    let after = pagination.object_cursor()?;
+    let selector = (!req.sandbox.is_empty()).then(|| format!("sandbox={}", req.sandbox));
+    let query = match (workspace.as_deref(), selector.as_deref()) {
+        (None, None) => ObjectListQuery::AllWorkspaces,
+        (Some(workspace), None) => ObjectListQuery::Workspace(workspace),
+        (Some(workspace), Some(selector)) => ObjectListQuery::WorkspaceSelector {
+            workspace,
+            label_selector: selector,
+        },
+        (None, Some(_)) => {
+            return Err(Status::invalid_argument(
+                "sandbox filter cannot be combined with all_workspaces",
+            ));
         }
-    }
-    .map_err(|e| Status::internal(format!("list endpoints failed: {e}")))?;
-
-    let services = endpoints
+    };
+    let page = state
+        .store
+        .list_message_page::<ServiceEndpoint>(query, after.as_ref(), pagination.page_size())
+        .await
+        .map_err(|e| Status::internal(format!("list endpoints failed: {e}")))?;
+    let services = page
+        .messages
         .into_iter()
         .map(|ep| service_endpoint_response(state, ep))
         .collect();
-
-    Ok(Response::new(ListServicesResponse { services }))
+    let next_page_token = pagination.next_object_token(page.next_cursor.as_ref());
+    Ok(Response::new(ListServicesResponse {
+        services,
+        next_page_token,
+    }))
 }
 
 pub(super) async fn handle_delete_service(
@@ -237,11 +253,11 @@ pub(super) async fn handle_delete_service(
 ) -> Result<Response<DeleteServiceResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let req = request.into_inner();
-    let authz = authorize_workspace(
+    let authz = authorize_workspace_selector(
         &state.store,
         &state.admin_role,
         &principal,
-        &req.workspace,
+        req.workspace_scope.as_ref(),
         MinWorkspaceRole::User,
     )
     .await?;
@@ -251,15 +267,22 @@ pub(super) async fn handle_delete_service(
     validate_endpoint_name("sandbox", &req.sandbox, MAX_SANDBOX_NAME_LEN)?;
     validate_optional_endpoint_name("service", &req.service, MAX_SERVICE_NAME_LEN)?;
 
+    state
+        .store
+        .get_message_by_name::<Sandbox>(&workspace, &req.sandbox)
+        .await
+        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+        .ok_or_else(|| Status::not_found("sandbox not found"))?;
     let endpoint = get_service_endpoint(state, &workspace, &req.sandbox, &req.service).await?;
     let Some(endpoint) = endpoint else {
-        return Ok(Response::new(DeleteServiceResponse { deleted: false }));
+        return Ok(Response::new(DeleteServiceResponse {
+            outcome: super::deletion_outcome(false, req.allow_missing, "service endpoint")?,
+        }));
     };
 
-    let key = service_routing::endpoint_key(&req.sandbox, &req.service);
     let deleted = state
         .store
-        .delete_by_name(ServiceEndpoint::object_type(), &workspace, &key)
+        .delete(ServiceEndpoint::object_type(), endpoint.object_id())
         .await
         .map_err(|e| Status::internal(format!("delete endpoint failed: {e}")))?;
 
@@ -267,7 +290,9 @@ pub(super) async fn handle_delete_service(
         service_routing::emit_service_endpoint_delete_event(&endpoint);
     }
 
-    Ok(Response::new(DeleteServiceResponse { deleted }))
+    Ok(Response::new(DeleteServiceResponse {
+        outcome: openshell_core::proto::DeletionOutcome::Completed.into(),
+    }))
 }
 
 async fn get_service_endpoint(
@@ -362,12 +387,12 @@ mod tests {
             metadata: Some(ObjectMeta {
                 id: format!("sandbox-{name}"),
                 name: name.to_string(),
-                created_at_ms: 1_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000).ok(),
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(openshell_core::proto::SandboxSpec::default()),
             ..Default::default()
@@ -409,11 +434,14 @@ mod tests {
         let exposed = handle_expose_service(
             &state,
             authed_request(ExposeServiceRequest {
+                request_id: String::new(),
                 sandbox: "my-sandbox".to_string(),
                 service: "web".to_string(),
                 target_port: 8080,
                 domain: true,
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -425,10 +453,11 @@ mod tests {
             &state,
             authed_request(ListServicesRequest {
                 sandbox: "my-sandbox".to_string(),
-                limit: 0,
-                offset: 0,
-                workspace: "default".to_string(),
-                all_workspaces: false,
+                page_size: 0,
+                page_token: String::new(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -445,7 +474,9 @@ mod tests {
             authed_request(GetServiceRequest {
                 sandbox: "my-sandbox".to_string(),
                 service: "web".to_string(),
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -456,22 +487,31 @@ mod tests {
         let deleted = handle_delete_service(
             &state,
             authed_request(DeleteServiceRequest {
+                request_id: String::new(),
+                allow_missing: false,
                 sandbox: "my-sandbox".to_string(),
                 service: "web".to_string(),
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
         .unwrap()
         .into_inner();
-        assert!(deleted.deleted);
+        assert_eq!(
+            deleted.outcome(),
+            openshell_core::proto::DeletionOutcome::Completed
+        );
 
         let err = handle_get_service(
             &state,
             authed_request(GetServiceRequest {
                 sandbox: "my-sandbox".to_string(),
                 service: "web".to_string(),
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -482,10 +522,11 @@ mod tests {
             &state,
             authed_request(ListServicesRequest {
                 sandbox: "my-sandbox".to_string(),
-                limit: 0,
-                offset: 0,
-                workspace: "default".to_string(),
-                all_workspaces: false,
+                page_size: 0,
+                page_token: String::new(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -505,11 +546,14 @@ mod tests {
             handle_expose_service(
                 &state1,
                 authed_request(ExposeServiceRequest {
+                    request_id: String::new(),
                     sandbox: "my-sandbox".to_string(),
                     service: "web".to_string(),
                     target_port: 8080,
                     domain: true,
-                    workspace: "default".to_string(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector(
+                        "default".to_string(),
+                    )),
                 }),
             )
             .await
@@ -520,11 +564,14 @@ mod tests {
             handle_expose_service(
                 &state2,
                 authed_request(ExposeServiceRequest {
+                    request_id: String::new(),
                     sandbox: "my-sandbox".to_string(),
                     service: "web".to_string(),
                     target_port: 9090,
                     domain: true,
-                    workspace: "default".to_string(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector(
+                        "default".to_string(),
+                    )),
                 }),
             )
             .await
@@ -547,10 +594,11 @@ mod tests {
             &state,
             authed_request(ListServicesRequest {
                 sandbox: "my-sandbox".to_string(),
-                limit: 0,
-                offset: 0,
-                workspace: "default".to_string(),
-                all_workspaces: false,
+                page_size: 0,
+                page_token: String::new(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -568,11 +616,14 @@ mod tests {
         handle_expose_service(
             &state,
             authed_request(ExposeServiceRequest {
+                request_id: String::new(),
                 sandbox: "my-sandbox".to_string(),
                 service: "web".to_string(),
                 target_port: 7070,
                 domain: true,
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -584,11 +635,14 @@ mod tests {
             handle_expose_service(
                 &state1,
                 authed_request(ExposeServiceRequest {
+                    request_id: String::new(),
                     sandbox: "my-sandbox".to_string(),
                     service: "web".to_string(),
                     target_port: 8080,
                     domain: true,
-                    workspace: "default".to_string(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector(
+                        "default".to_string(),
+                    )),
                 }),
             )
             .await
@@ -599,11 +653,14 @@ mod tests {
             handle_expose_service(
                 &state2,
                 authed_request(ExposeServiceRequest {
+                    request_id: String::new(),
                     sandbox: "my-sandbox".to_string(),
                     service: "web".to_string(),
                     target_port: 9090,
                     domain: true,
-                    workspace: "default".to_string(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector(
+                        "default".to_string(),
+                    )),
                 }),
             )
             .await
@@ -626,7 +683,9 @@ mod tests {
             authed_request(GetServiceRequest {
                 sandbox: "my-sandbox".to_string(),
                 service: "web".to_string(),
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -652,6 +711,7 @@ mod tests {
         crate::grpc::workspace::handle_create_workspace(
             &state,
             Request::new(CreateWorkspaceRequest {
+                request_id: String::new(),
                 name: "beta".to_string(),
                 labels: HashMap::new(),
             }),
@@ -666,12 +726,12 @@ mod tests {
             metadata: Some(ObjectMeta {
                 id: "sandbox-my-sandbox-beta".to_string(),
                 name: "my-sandbox".to_string(),
-                created_at_ms: 1_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_000).ok(),
                 labels: HashMap::new(),
                 annotations: HashMap::new(),
                 resource_version: 0,
                 workspace: "beta".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             spec: Some(openshell_core::proto::SandboxSpec::default()),
             ..Default::default()
@@ -683,11 +743,14 @@ mod tests {
         handle_expose_service(
             &state,
             authed_request(ExposeServiceRequest {
+                request_id: String::new(),
                 sandbox: "my-sandbox".to_string(),
                 service: "web".to_string(),
                 target_port: 8080,
                 domain: true,
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -696,11 +759,14 @@ mod tests {
         handle_expose_service(
             &state,
             authed_request(ExposeServiceRequest {
+                request_id: String::new(),
                 sandbox: "my-sandbox".to_string(),
                 service: "web".to_string(),
                 target_port: 9090,
                 domain: true,
-                workspace: "beta".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "beta".to_string(),
+                )),
             }),
         )
         .await
@@ -712,7 +778,9 @@ mod tests {
             authed_request(GetServiceRequest {
                 sandbox: "my-sandbox".to_string(),
                 service: "web".to_string(),
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -726,7 +794,9 @@ mod tests {
             authed_request(GetServiceRequest {
                 sandbox: "my-sandbox".to_string(),
                 service: "web".to_string(),
-                workspace: "beta".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "beta".to_string(),
+                )),
             }),
         )
         .await
@@ -739,10 +809,11 @@ mod tests {
             &state,
             authed_request(ListServicesRequest {
                 sandbox: "my-sandbox".to_string(),
-                limit: 100,
-                offset: 0,
-                workspace: "default".to_string(),
-                all_workspaces: false,
+                page_size: 100,
+                page_token: String::new(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -758,10 +829,11 @@ mod tests {
             &state,
             authed_request(ListServicesRequest {
                 sandbox: "my-sandbox".to_string(),
-                limit: 100,
-                offset: 0,
-                workspace: "beta".to_string(),
-                all_workspaces: false,
+                page_size: 100,
+                page_token: String::new(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "beta".to_string(),
+                )),
             }),
         )
         .await
@@ -777,24 +849,32 @@ mod tests {
         let deleted = handle_delete_service(
             &state,
             authed_request(DeleteServiceRequest {
+                request_id: String::new(),
+                allow_missing: false,
                 sandbox: "my-sandbox".to_string(),
                 service: "web".to_string(),
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
         .unwrap()
         .into_inner();
-        assert!(deleted.deleted);
+        assert_eq!(
+            deleted.outcome(),
+            openshell_core::proto::DeletionOutcome::Completed
+        );
 
         let listed = handle_list_services(
             &state,
             authed_request(ListServicesRequest {
                 sandbox: "my-sandbox".to_string(),
-                limit: 100,
-                offset: 0,
-                workspace: "default".to_string(),
-                all_workspaces: false,
+                page_size: 100,
+                page_token: String::new(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -807,7 +887,9 @@ mod tests {
             authed_request(GetServiceRequest {
                 sandbox: "my-sandbox".to_string(),
                 service: "web".to_string(),
-                workspace: "beta".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "beta".to_string(),
+                )),
             }),
         )
         .await
@@ -820,11 +902,14 @@ mod tests {
         handle_expose_service(
             &state,
             authed_request(ExposeServiceRequest {
+                request_id: String::new(),
                 sandbox: "my-sandbox".to_string(),
                 service: "api".to_string(),
                 target_port: 3000,
                 domain: true,
-                workspace: "default".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
             }),
         )
         .await
@@ -834,31 +919,15 @@ mod tests {
             &state,
             authed_request(ListServicesRequest {
                 sandbox: String::new(),
-                limit: 100,
-                offset: 0,
-                workspace: String::new(),
-                all_workspaces: true,
+                page_size: 100,
+                page_token: String::new(),
+                workspace_scope: Some(openshell_core::proto::all_workspaces_selector()),
             }),
         )
         .await
         .unwrap()
         .into_inner();
         assert_eq!(listed.services.len(), 2);
-
-        // all_workspaces with non-empty workspace is rejected.
-        let err = handle_list_services(
-            &state,
-            authed_request(ListServicesRequest {
-                sandbox: String::new(),
-                limit: 100,
-                offset: 0,
-                workspace: "default".to_string(),
-                all_workspaces: true,
-            }),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
 
     /// Non-member callers must receive `PERMISSION_DENIED` — not `NOT_FOUND` —
@@ -889,7 +958,7 @@ mod tests {
         let err = handle_expose_service(
             &state,
             non_member_request(ExposeServiceRequest {
-                workspace: "no-such-ws".into(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("no-such-ws")),
                 ..Default::default()
             }),
         )
@@ -905,7 +974,7 @@ mod tests {
         let err = handle_get_service(
             &state,
             non_member_request(GetServiceRequest {
-                workspace: "no-such-ws".into(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("no-such-ws")),
                 ..Default::default()
             }),
         )
@@ -921,7 +990,7 @@ mod tests {
         let err = handle_list_services(
             &state,
             non_member_request(ListServicesRequest {
-                workspace: "no-such-ws".into(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("no-such-ws")),
                 ..Default::default()
             }),
         )
@@ -937,7 +1006,8 @@ mod tests {
         let err = handle_delete_service(
             &state,
             non_member_request(DeleteServiceRequest {
-                workspace: "no-such-ws".into(),
+                allow_missing: false,
+                workspace_scope: Some(openshell_core::proto::workspace_selector("no-such-ws")),
                 ..Default::default()
             }),
         )

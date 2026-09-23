@@ -15,10 +15,9 @@ use notify::event::EventKind;
 use notify::{Event, RecursiveMode, Watcher};
 use openshell_core::{Error, Result};
 use openshell_ocsf::{
-    ConfigStateChangeBuilder, OCSF_TARGET, SandboxContext, SeverityId, StateId, StatusId,
+    ConfigStateChangeBuilder, EventContext, OCSF_TARGET, SeverityId, StateId, StatusId,
 };
 use rustls::ServerConfig;
-use rustls::crypto::ring::sign;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert, WebPkiClientVerifier};
 use rustls::sign::CertifiedKey;
@@ -324,9 +323,30 @@ impl std::fmt::Debug for DualCertResolver {
 fn load_certified_key(cert_path: &Path, key_path: &Path) -> Result<Arc<CertifiedKey>> {
     let certs = load_certs(cert_path)?;
     let key = load_key(key_path)?;
-    let signing_key = sign::any_supported_type(&key)
+    let signing_key = openshell_crypto::tls::any_supported_signing_key(&key)
         .map_err(|e| Error::tls(format!("unsupported private key type: {e}")))?;
     Ok(Arc::new(CertifiedKey::new(certs, signing_key)))
+}
+
+/// Validate SNI certificate option relationships without reading certificate files.
+pub fn validate_external_cert_config(
+    external_cert_path: Option<&Path>,
+    external_key_path: Option<&Path>,
+    external_server_names: &[String],
+) -> Result<()> {
+    match (external_cert_path, external_key_path) {
+        (Some(_), None) => Err(Error::tls(
+            "external_cert_path is set but external_key_path is missing",
+        )),
+        (None, Some(_)) => Err(Error::tls(
+            "external_key_path is set but external_cert_path is missing",
+        )),
+        (Some(_), Some(_)) if external_server_names.is_empty() => Err(Error::tls(
+            "external certificate is configured but external_server_names is empty — \
+             the external cert would never be served",
+        )),
+        (None, None) | (Some(_), Some(_)) => Ok(()),
+    }
 }
 
 /// Build an SNI-based cert resolver when an external certificate is configured.
@@ -338,30 +358,17 @@ fn build_cert_resolver(
     external_key_path: Option<&Path>,
     external_server_names: &[String],
 ) -> Result<Option<Arc<dyn ResolvesServerCert>>> {
-    match (external_cert_path, external_key_path) {
-        (None, None) => Ok(None),
-        (Some(_), None) => Err(Error::tls(
-            "external_cert_path is set but external_key_path is missing",
-        )),
-        (None, Some(_)) => Err(Error::tls(
-            "external_key_path is set but external_cert_path is missing",
-        )),
-        (Some(ext_cert_path), Some(ext_key_path)) => {
-            if external_server_names.is_empty() {
-                return Err(Error::tls(
-                    "external certificate is configured but external_server_names is empty — \
-                     the external cert would never be served",
-                ));
-            }
-            let internal = load_certified_key(cert_path, key_path)?;
-            let external = load_certified_key(ext_cert_path, ext_key_path)?;
-            Ok(Some(Arc::new(DualCertResolver {
-                internal,
-                external,
-                external_names: external_server_names.to_vec(),
-            })))
-        }
-    }
+    validate_external_cert_config(external_cert_path, external_key_path, external_server_names)?;
+    let (Some(ext_cert_path), Some(ext_key_path)) = (external_cert_path, external_key_path) else {
+        return Ok(None);
+    };
+    let internal = load_certified_key(cert_path, key_path)?;
+    let external = load_certified_key(ext_cert_path, ext_key_path)?;
+    Ok(Some(Arc::new(DualCertResolver {
+        internal,
+        external,
+        external_names: external_server_names.to_vec(),
+    })))
 }
 
 /// Build a `ServerConfig` from certificate, key, and optional client CA files.
@@ -379,7 +386,7 @@ fn build_server_config(
 
     // Validate the key type early — rustls defers this to handshake time,
     // which produces a cryptic error. A bad key type surfaces clearly here.
-    sign::any_supported_type(&key)
+    openshell_crypto::tls::any_supported_signing_key(&key)
         .map_err(|e| Error::tls(format!("unsupported private key type: {e}")))?;
 
     let resolver = build_cert_resolver(
@@ -399,7 +406,10 @@ fn build_server_config(
                 .map_err(|e| Error::tls(format!("failed to add CA certificate: {e}")))?;
         }
 
-        let verifier_builder = WebPkiClientVerifier::builder(Arc::new(root_store));
+        let verifier_builder = WebPkiClientVerifier::builder_with_provider(
+            Arc::new(root_store),
+            openshell_crypto::tls::configuration_provider(),
+        );
         let verifier = if require_client_auth {
             verifier_builder
         } else {
@@ -408,7 +418,7 @@ fn build_server_config(
         .build()
         .map_err(|e| Error::tls(format!("failed to build client verifier: {e}")))?;
 
-        let builder = ServerConfig::builder().with_client_cert_verifier(verifier);
+        let builder = openshell_crypto::tls::server_builder().with_client_cert_verifier(verifier);
         if let Some(resolver) = resolver {
             builder.with_cert_resolver(resolver)
         } else {
@@ -417,7 +427,7 @@ fn build_server_config(
                 .map_err(|e| Error::tls(format!("failed to create TLS config: {e}")))?
         }
     } else {
-        let builder = ServerConfig::builder().with_no_client_auth();
+        let builder = openshell_crypto::tls::server_builder().with_no_client_auth();
         if let Some(resolver) = resolver {
             builder.with_cert_resolver(resolver)
         } else {
@@ -473,8 +483,8 @@ fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
 }
 
 /// Build an OCSF context for gateway-level (non-sandbox) events.
-fn tls_ocsf_ctx() -> SandboxContext {
-    SandboxContext {
+fn tls_ocsf_ctx() -> EventContext {
+    EventContext {
         sandbox_id: String::new(),
         sandbox_name: String::new(),
         container_image: "openshell/gateway".to_string(),
@@ -488,10 +498,9 @@ fn tls_ocsf_ctx() -> SandboxContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tls_test_utils::{
-        generate_test_certs_with_ca, install_rustls_provider, write_test_file,
-    };
-    use rcgen::{CertificateParams, IsCa, KeyPair, KeyUsagePurpose};
+    use crate::tls_test_utils::{generate_test_certs_with_ca, write_test_file};
+    use openshell_crypto::pki::KeyPair;
+    use rcgen::{CertificateParams, IsCa, KeyUsagePurpose};
     use tokio::net::{TcpListener, TcpStream};
 
     /// Generate a new server cert + key in `dir`, signed by the given CA.
@@ -499,13 +508,18 @@ mod tests {
     fn generate_server_cert(ca_cert: &rcgen::Certificate, ca_key: &KeyPair, dir: &Path) {
         let server_params = CertificateParams::new(vec!["localhost".to_string()])
             .expect("failed to create server params");
-        let server_key = KeyPair::generate().expect("failed to generate server key");
-        let server_cert = server_params
-            .signed_by(&server_key, ca_cert, ca_key)
-            .expect("failed to sign server cert");
+        let server_key =
+            openshell_crypto::pki::generate_keypair().expect("failed to generate server key");
+        let server_cert =
+            openshell_crypto::pki::signed_by(server_params, &server_key, ca_cert, ca_key)
+                .expect("failed to sign server cert");
 
         write_test_file(dir, "server-cert.pem", server_cert.pem().as_bytes());
-        write_test_file(dir, "server-key.pem", server_key.serialize_pem().as_bytes());
+        write_test_file(
+            dir,
+            "server-key.pem",
+            server_key.serialize_pem().unwrap().as_bytes(),
+        );
     }
 
     fn build_test_client_config(ca_path: &Path) -> Arc<rustls::ClientConfig> {
@@ -517,7 +531,7 @@ mod tests {
                 .expect("failed to add CA to root store");
         }
         Arc::new(
-            rustls::ClientConfig::builder()
+            openshell_crypto::tls::client_builder()
                 .with_root_certificates(root_store)
                 .with_no_client_auth(),
         )
@@ -532,7 +546,6 @@ mod tests {
 
     #[test]
     fn test_build_server_config() {
-        install_rustls_provider();
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let _ = generate_test_certs_with_ca(dir.path());
 
@@ -553,7 +566,6 @@ mod tests {
 
     #[test]
     fn test_reload_success() {
-        install_rustls_provider();
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let (ca_cert, ca_key) = generate_test_certs_with_ca(dir.path());
 
@@ -574,7 +586,6 @@ mod tests {
 
     #[test]
     fn test_reload_invalid_preserves_old() {
-        install_rustls_provider();
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         generate_test_certs_with_ca(dir.path());
 
@@ -607,8 +618,6 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_concurrent_handshake_and_reload() {
-        install_rustls_provider();
-
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let (ca_cert, ca_key) = generate_test_certs_with_ca(dir.path());
         let acceptor = TlsAcceptor::from_files(
@@ -702,8 +711,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_reload_serves_new_cert() {
-        install_rustls_provider();
-
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let (ca_cert, ca_key) = generate_test_certs_with_ca(dir.path());
         let acceptor = TlsAcceptor::from_files(
@@ -778,8 +785,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_reload_worker_shutdown() {
-        install_rustls_provider();
-
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         generate_test_certs_with_ca(dir.path());
         let acceptor = TlsAcceptor::from_files(
@@ -812,8 +817,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_reload_worker_detects_file_change() {
-        install_rustls_provider();
-
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let (ca_cert, ca_key) = generate_test_certs_with_ca(dir.path());
         let acceptor = TlsAcceptor::from_files(
@@ -902,8 +905,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_reload_mtls_ca_rotation() {
-        install_rustls_provider();
-
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let (initial_ca_cert, initial_ca_key) = generate_test_certs_with_ca(dir.path());
 
@@ -925,9 +926,9 @@ mod tests {
         new_ca_params
             .distinguished_name
             .push(rcgen::DnType::CommonName, "new-ca");
-        let new_ca_key = KeyPair::generate().expect("failed to generate new CA key");
-        let new_ca_cert = new_ca_params
-            .self_signed(&new_ca_key)
+        let new_ca_key =
+            openshell_crypto::pki::generate_keypair().expect("failed to generate new CA key");
+        let new_ca_cert = openshell_crypto::pki::self_signed(new_ca_params, &new_ca_key)
             .expect("failed to sign new CA cert");
         std::fs::write(dir.path().join("ca.pem"), new_ca_cert.pem().as_bytes())
             .expect("failed to write new CA");
@@ -939,7 +940,8 @@ mod tests {
             .expect("reload with new CA should succeed");
 
         // Generate client cert signed by new CA, write to files
-        let client_key = KeyPair::generate().expect("failed to generate client key");
+        let client_key =
+            openshell_crypto::pki::generate_keypair().expect("failed to generate client key");
         let mut client_params =
             CertificateParams::new(Vec::<String>::new()).expect("failed to create client params");
         client_params
@@ -949,17 +951,20 @@ mod tests {
             KeyUsagePurpose::DigitalSignature,
             KeyUsagePurpose::KeyEncipherment,
         ];
-        let client_cert = client_params
-            .signed_by(&client_key, &new_ca_cert, &new_ca_key)
-            .expect("failed to sign client cert");
+        let client_cert =
+            openshell_crypto::pki::signed_by(client_params, &client_key, &new_ca_cert, &new_ca_key)
+                .expect("failed to sign client cert");
 
         // Write client cert + key as PEM files and load via load_certs/load_key
         let client_cert_path = dir.path().join("client-cert.pem");
         let client_key_path = dir.path().join("client-key.pem");
         std::fs::write(&client_cert_path, client_cert.pem().as_bytes())
             .expect("failed to write client cert");
-        std::fs::write(&client_key_path, client_key.serialize_pem().as_bytes())
-            .expect("failed to write client key");
+        std::fs::write(
+            &client_key_path,
+            client_key.serialize_pem().unwrap().as_bytes(),
+        )
+        .expect("failed to write client key");
 
         let client_cert_chain = load_certs(&client_cert_path).expect("failed to load client cert");
         let client_private_key = load_key(&client_key_path).expect("failed to load client key");
@@ -969,7 +974,7 @@ mod tests {
             .add(CertificateDer::from(new_ca_cert.der().to_vec()))
             .expect("failed to add new CA to root store");
         let new_ca_client_config = Arc::new(
-            rustls::ClientConfig::builder()
+            openshell_crypto::tls::client_builder()
                 .with_root_certificates(root_store)
                 .with_client_auth_cert(client_cert_chain, client_private_key)
                 .expect("failed to set client auth cert"),
@@ -1006,7 +1011,8 @@ mod tests {
 
         // Verify old CA is no longer trusted: a client cert signed by the
         // initial CA should be rejected after rotation.
-        let old_client_key = KeyPair::generate().expect("failed to generate old client key");
+        let old_client_key =
+            openshell_crypto::pki::generate_keypair().expect("failed to generate old client key");
         let mut old_client_params = CertificateParams::new(Vec::<String>::new())
             .expect("failed to create old client params");
         old_client_params
@@ -1016,16 +1022,23 @@ mod tests {
             KeyUsagePurpose::DigitalSignature,
             KeyUsagePurpose::KeyEncipherment,
         ];
-        let old_client_cert = old_client_params
-            .signed_by(&old_client_key, &initial_ca_cert, &initial_ca_key)
-            .expect("failed to sign old client cert");
+        let old_client_cert = openshell_crypto::pki::signed_by(
+            old_client_params,
+            &old_client_key,
+            &initial_ca_cert,
+            &initial_ca_key,
+        )
+        .expect("failed to sign old client cert");
 
         let old_cert_path = dir.path().join("old-client-cert.pem");
         let old_key_path = dir.path().join("old-client-key.pem");
         std::fs::write(&old_cert_path, old_client_cert.pem().as_bytes())
             .expect("failed to write old client cert");
-        std::fs::write(&old_key_path, old_client_key.serialize_pem().as_bytes())
-            .expect("failed to write old client key");
+        std::fs::write(
+            &old_key_path,
+            old_client_key.serialize_pem().unwrap().as_bytes(),
+        )
+        .expect("failed to write old client key");
 
         let old_cert_chain = load_certs(&old_cert_path).expect("failed to load old client cert");
         let old_key_der = load_key(&old_key_path).expect("failed to load old client key");
@@ -1035,7 +1048,7 @@ mod tests {
             .add(CertificateDer::from(new_ca_cert.der().to_vec()))
             .expect("failed to add new CA to root store");
         let old_ca_client_config = Arc::new(
-            rustls::ClientConfig::builder()
+            openshell_crypto::tls::client_builder()
                 .with_root_certificates(old_root_store)
                 .with_client_auth_cert(old_cert_chain, old_key_der)
                 .expect("failed to set old client auth cert"),
@@ -1081,12 +1094,11 @@ mod tests {
     ) {
         let params =
             CertificateParams::new(vec![san.to_string()]).expect("failed to create cert params");
-        let key = KeyPair::generate().expect("failed to generate key");
-        let cert = params
-            .signed_by(&key, ca_cert, ca_key)
+        let key = openshell_crypto::pki::generate_keypair().expect("failed to generate key");
+        let cert = openshell_crypto::pki::signed_by(params, &key, ca_cert, ca_key)
             .expect("failed to sign cert");
         write_test_file(dir, cert_file, cert.pem().as_bytes());
-        write_test_file(dir, key_file, key.serialize_pem().as_bytes());
+        write_test_file(dir, key_file, key.serialize_pem().unwrap().as_bytes());
     }
 
     #[test]
@@ -1110,7 +1122,6 @@ mod tests {
 
     #[test]
     fn test_build_cert_resolver_returns_none_when_no_external() {
-        install_rustls_provider();
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         generate_test_certs_with_ca(dir.path());
 
@@ -1127,7 +1138,6 @@ mod tests {
 
     #[test]
     fn test_build_cert_resolver_errors_on_cert_without_key() {
-        install_rustls_provider();
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         generate_test_certs_with_ca(dir.path());
 
@@ -1147,7 +1157,6 @@ mod tests {
 
     #[test]
     fn test_build_cert_resolver_errors_on_key_without_cert() {
-        install_rustls_provider();
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         generate_test_certs_with_ca(dir.path());
 
@@ -1167,7 +1176,6 @@ mod tests {
 
     #[test]
     fn test_build_cert_resolver_errors_on_empty_server_names() {
-        install_rustls_provider();
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let (ca_cert, ca_key) = generate_test_certs_with_ca(dir.path());
         generate_named_cert(
@@ -1195,7 +1203,6 @@ mod tests {
 
     #[test]
     fn test_dual_cert_resolver_returns_external_on_sni_match() {
-        install_rustls_provider();
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let (ca_cert, ca_key) = generate_test_certs_with_ca(dir.path());
         generate_named_cert(
@@ -1233,8 +1240,6 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_dual_cert_resolver_sni_selects_correct_cert() {
-        install_rustls_provider();
-
         let dir = tempfile::tempdir().expect("failed to create tempdir");
         let (ca_cert, ca_key) = generate_test_certs_with_ca(dir.path());
         generate_named_cert(

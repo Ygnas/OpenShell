@@ -3,9 +3,7 @@
 
 mod helpers;
 
-use helpers::{
-    EnvVarGuard, build_ca, build_client_cert, build_server_cert, install_rustls_provider,
-};
+use helpers::{EnvVarGuard, build_ca, build_client_cert, build_server_cert};
 use openshell_bootstrap::{get_gateway_metadata, load_active_gateway};
 use openshell_cli::{
     run,
@@ -34,6 +32,22 @@ struct TestOpenShell;
 
 #[tonic::async_trait]
 impl OpenShell for TestOpenShell {
+    async fn report_endpoint_status(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ReportEndpointStatusRequest>,
+    ) -> Result<Response<openshell_core::proto::ReportEndpointStatusResponse>, Status> {
+        Ok(Response::new(
+            openshell_core::proto::ReportEndpointStatusResponse {},
+        ))
+    }
+
+    async fn begin_rootfs_tar_staging(
+        &self,
+        _request: tonic::Request<openshell_core::proto::BeginRootfsTarStagingRequest>,
+    ) -> Result<Response<openshell_core::proto::BeginRootfsTarStagingResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
     async fn report_main_process_exit(
         &self,
         _request: tonic::Request<openshell_core::proto::ReportMainProcessExitRequest>,
@@ -113,6 +127,8 @@ impl OpenShell for TestOpenShell {
         ))
     }
 
+    unimplemented_sandbox_template_rpcs!();
+
     async fn list_sandbox_providers(
         &self,
         _request: tonic::Request<openshell_core::proto::ListSandboxProvidersRequest>,
@@ -145,7 +161,10 @@ impl OpenShell for TestOpenShell {
         _request: tonic::Request<openshell_core::proto::DeleteSandboxRequest>,
     ) -> Result<Response<openshell_core::proto::DeleteSandboxResponse>, Status> {
         Ok(Response::new(
-            openshell_core::proto::DeleteSandboxResponse { deleted: true },
+            openshell_core::proto::DeleteSandboxResponse {
+                sandbox_id: String::new(),
+                outcome: openshell_core::proto::DeletionOutcome::Completed.into(),
+            },
         ))
     }
 
@@ -164,6 +183,24 @@ impl OpenShell for TestOpenShell {
     ) -> Result<Response<openshell_core::proto::GetGatewayConfigResponse>, Status> {
         Ok(Response::new(
             openshell_core::proto::GetGatewayConfigResponse::default(),
+        ))
+    }
+
+    async fn get_sandbox_provider_status(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetSandboxProviderStatusRequest>,
+    ) -> Result<Response<openshell_core::proto::GetSandboxProviderStatusResponse>, Status> {
+        Err(Status::unimplemented(
+            "provider readiness is not exercised by this mock",
+        ))
+    }
+
+    async fn report_provider_readiness(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ReportProviderReadinessRequest>,
+    ) -> Result<Response<openshell_core::proto::ReportProviderReadinessResponse>, Status> {
+        Err(Status::unimplemented(
+            "provider installation reports are not exercised by this mock",
         ))
     }
 
@@ -398,6 +435,13 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<openshell_core::proto::ListSandboxPoliciesRequest>,
     ) -> Result<Response<openshell_core::proto::ListSandboxPoliciesResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn report_sandbox_configuration(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ReportSandboxConfigurationRequest>,
+    ) -> Result<Response<openshell_core::proto::ReportSandboxConfigurationResponse>, Status> {
         Err(Status::unimplemented("not implemented in test"))
     }
 
@@ -642,8 +686,6 @@ fn isolated_gateway_add_env(
 
 #[tokio::test]
 async fn gateway_add_mtls_loopback_uses_explicit_gateway_name() {
-    install_rustls_provider();
-
     let (ca, ca_key) = build_ca();
     let (server_cert, server_key) = build_server_cert(&ca, &ca_key);
     let (client_cert, client_key) = build_client_cert(&ca, &ca_key);
@@ -686,8 +728,6 @@ async fn gateway_add_mtls_loopback_uses_explicit_gateway_name() {
 
 #[tokio::test]
 async fn gateway_add_mtls_loopback_without_name_uses_openshell_default() {
-    install_rustls_provider();
-
     let (ca, ca_key) = build_ca();
     let (server_cert, server_key) = build_server_cert(&ca, &ca_key);
     let (client_cert, client_key) = build_client_cert(&ca, &ca_key);
@@ -729,8 +769,6 @@ async fn gateway_add_mtls_loopback_without_name_uses_openshell_default() {
 
 #[tokio::test]
 async fn gateway_add_mtls_loopback_explicit_name_does_not_fallback_to_openshell_certs() {
-    install_rustls_provider();
-
     let (ca, ca_key) = build_ca();
     let (client_cert, client_key) = build_client_cert(&ca, &ca_key);
     let ca_cert = ca.pem();
@@ -768,7 +806,6 @@ async fn gateway_add_mtls_loopback_explicit_name_does_not_fallback_to_openshell_
 #[tokio::test]
 async fn cli_connects_with_client_cert() {
     let _env = EnvVarGuard::set(&[]);
-    install_rustls_provider();
 
     let (ca, ca_key) = build_ca();
     let (server_cert, server_key) = build_server_cert(&ca, &ca_key);
@@ -794,8 +831,6 @@ async fn cli_connects_with_client_cert() {
 
 #[tokio::test]
 async fn cli_requires_client_cert_for_https() {
-    install_rustls_provider();
-
     let (ca, ca_key) = build_ca();
     let (server_cert, server_key) = build_server_cert(&ca, &ca_key);
     let ca_cert = ca.pem();
@@ -842,7 +877,6 @@ async fn run_server_no_client_auth(
 #[tokio::test]
 async fn cli_connects_with_gateway_insecure() {
     let _env = EnvVarGuard::set(&[]);
-    install_rustls_provider();
 
     let (ca, ca_key) = build_ca();
     let (server_cert, server_key) = build_server_cert(&ca, &ca_key);

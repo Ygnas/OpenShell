@@ -755,6 +755,7 @@ mod tests {
 
     fn create_provider_operation(codec: &ProtoJsonCodec) -> ValidatedOperation {
         let request = CreateProviderRequest {
+            request_id: String::new(),
             provider: Some(Provider {
                 r#type: "github".to_string(),
                 credentials: HashMap::from([(
@@ -764,7 +765,7 @@ mod tests {
                 config: HashMap::from([("region".to_string(), "old".to_string())]),
                 ..Provider::default()
             }),
-            workspace: String::new(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
         };
         let json = codec
             .decode_message_to_json("openshell.v1.CreateProviderRequest", &request)
@@ -1009,6 +1010,7 @@ mod tests {
             codec: codec.clone(),
         };
         let request = UpdateConfigRequest {
+            request_id: String::new(),
             name: "demo".to_string(),
             expected_resource_version: u64::MAX - 1,
             annotations: HashMap::from([
@@ -1017,6 +1019,7 @@ mod tests {
                 ("policy-signature-kid".to_string(), "kid".to_string()),
                 ("correlation-id".to_string(), "reload-1".to_string()),
             ]),
+            workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
             ..UpdateConfigRequest::default()
         };
         let body = GrpcFrame {
@@ -1048,6 +1051,7 @@ mod tests {
         let codec =
             ProtoJsonCodec::from_descriptor_set(openshell_core::FILE_DESCRIPTOR_SET).unwrap();
         let request = CreateSandboxRequest {
+            request_id: String::new(),
             spec: Some(SandboxSpec {
                 template: Some(SandboxTemplate {
                     resources: Some(
@@ -1074,8 +1078,9 @@ mod tests {
             name: "demo".to_string(),
             labels: HashMap::new(),
             annotations: HashMap::new(),
-            workspace: String::new(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
             await_main_process_attachment: false,
+            workload_template_name: String::new(),
         };
 
         let bytes = request.encode_to_vec();

@@ -11,11 +11,12 @@ name = "openshell-e2e"
 description = "End-to-end tests for the OpenShell CLI"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.90"
+rust-version = "1.94"
 license = "Apache-2.0"
 publish = false
 
 [features]
+# Selects the common E2E suite.
 e2e = []
 # Selects tests that rely on `host.openshell.internal` (the sandbox's stable
 # alias to the host running test fixtures). docker, podman, and vm wire the
@@ -34,8 +35,12 @@ e2e-kubernetes-workspace-operator = ["e2e-kubernetes"]
 e2e-podman = ["e2e", "e2e-host-gateway", "e2e-local-container-driver"]
 e2e-podman-gpu = ["e2e-podman", "e2e-gpu"]
 e2e-oidc-pkce = []
-e2e-provider-refresh-keycloak = []
 e2e-vm = ["e2e", "e2e-host-gateway"]
+
+[[test]]
+name = "policy_activation"
+path = "tests/policy_activation.rs"
+required-features = ["e2e-docker"]
 
 [[test]]
 name = "oidc_pkce"
@@ -43,14 +48,19 @@ path = "tests/oidc_pkce.rs"
 required-features = ["e2e-oidc-pkce"]
 
 [[test]]
-name = "provider_refresh_keycloak"
-path = "tests/provider_refresh_keycloak.rs"
-required-features = ["e2e-provider-refresh-keycloak"]
+name = "vm_overlay"
+path = "tests/vm_overlay.rs"
+required-features = ["e2e-vm"]
 
 [[test]]
 name = "custom_image"
 path = "tests/custom_image.rs"
 required-features = ["e2e-docker"]
+
+[[test]]
+name = "rootfs_tar"
+path = "tests/rootfs_tar.rs"
+required-features = ["e2e-vm"]
 
 [[test]]
 name = "docker_preflight"
@@ -98,8 +108,18 @@ path = "tests/provider_refresh_handles.rs"
 required-features = ["e2e-podman"]
 
 [[test]]
+name = "provider_readiness"
+path = "tests/provider_readiness.rs"
+required-features = ["e2e-docker"]
+
+[[test]]
 name = "vm_gateway_start"
 path = "tests/vm_gateway_start.rs"
+required-features = ["e2e-vm"]
+
+[[test]]
+name = "vm_corporate_proxy"
+path = "tests/vm_corporate_proxy.rs"
 required-features = ["e2e-vm"]
 
 [[test]]
@@ -163,6 +183,11 @@ path = "tests/workspace_lifecycle.rs"
 required-features = ["e2e"]
 
 [[test]]
+name = "sandbox_templates"
+path = "tests/sandbox_templates.rs"
+required-features = ["e2e"]
+
+[[test]]
 name = "proxy_egress_pipeline"
 path = "tests/proxy_egress_pipeline.rs"
 required-features = ["e2e-host-gateway"]
@@ -183,6 +208,7 @@ path = "tests/gpu.rs"
 required-features = ["e2e-gpu"]
 
 [dependencies]
+openshell-crypto = { path = "../../crates/openshell-crypto" }
 base64 = "0.22"
 bollard = "0.20"
 bytes = "1"
@@ -190,7 +216,7 @@ futures-util = "0.3"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
-jsonwebtoken = "9"
+jsonwebtoken = "10"
 prost = "0.14"
 tokio = { version = "1.43", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["net"] }
@@ -201,7 +227,7 @@ hex = "0.4"
 rand = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-serde_yml = "0.0.12"
+serde_yml = { package = "noyalib", version = "0.0.28", default-features = false, features = ["std", "compat-serde-yaml"] }
 tonic = { version = "0.14", features = ["transport"] }
 tonic-prost = "0.14"
 tower = "0.5"
@@ -222,3 +248,7 @@ module_name_repetitions = "allow"
 must_use_candidate = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
+[[test]]
+name = "live_internet_traffic_perf"
+path = "tests/live_internet_traffic_perf.rs"
+required-features = ["e2e-host-gateway"]

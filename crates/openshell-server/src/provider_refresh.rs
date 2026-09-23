@@ -6,14 +6,15 @@
 #![allow(clippy::result_large_err)]
 
 use crate::credentials::RefreshMaterialScope;
-use crate::persistence::{ObjectType, PersistenceError, Store, WriteCondition, current_time_ms};
+use crate::persistence::{
+    ObjectListQuery, ObjectType, PersistenceError, Store, WriteCondition, current_time_ms,
+};
 use openshell_core::ObjectWorkspace;
 use openshell_core::proto::{
     CredentialHandle, Provider, ProviderCredentialRefreshRecoveryAction,
     ProviderCredentialRefreshStatus, ProviderCredentialRefreshStrategy,
-    StoredProviderCredentialRefreshState, StoredRefreshMaterialDeletion,
 };
-use openshell_core::{ObjectId, ObjectName, SetResourceVersion};
+use openshell_core::{ObjectId, ObjectName};
 use prost::Message;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -21,11 +22,16 @@ use std::time::Duration;
 use tonic::{Code, Status};
 use tracing::{info, warn};
 
+use crate::storage_proto::{
+    StoredProviderCredentialRefreshStateV2 as StoredProviderCredentialRefreshState,
+    StoredRefreshMaterialDeletion,
+};
+
 const DEFAULT_REFRESH_BEFORE_SECONDS: i64 = 300;
+const EXPIRATION_PRESENT_ANNOTATION: &str = "openshell.nvidia.com/refresh-expiration-present";
 const DEFAULT_MAX_LIFETIME_SECONDS: i64 = 3600;
 const REFRESH_ERROR_RETRY_SECONDS: i64 = 60;
 const REFRESH_CONFIGURATION_RETRY_SECONDS: i64 = 60 * 60;
-const REFRESH_WORKER_PAGE_SIZE: u32 = 1000;
 const MAX_OAUTH_ERROR_RESPONSE_BYTES: usize = 8 * 1024;
 
 pub fn refresh_material_scope(
@@ -170,51 +176,19 @@ pub async fn list_refresh_states_for_provider(
     store: &Store,
     provider_id: &str,
 ) -> Result<Vec<StoredProviderCredentialRefreshState>, Status> {
-    let records = store
-        .list_by_scope(
-            StoredProviderCredentialRefreshState::object_type(),
-            provider_id,
-            1000,
-            0,
-        )
+    store
+        .collect_messages(ObjectListQuery::Scope(provider_id))
         .await
-        .map_err(|e| Status::internal(format!("list provider refresh states failed: {e}")))?;
-
-    let mut states = Vec::with_capacity(records.len());
-    for record in records {
-        let mut state = StoredProviderCredentialRefreshState::decode(record.payload.as_slice())
-            .map_err(|e| Status::internal(format!("decode provider refresh state failed: {e}")))?;
-        state.set_resource_version(record.resource_version);
-        states.push(state);
-    }
-    Ok(states)
+        .map_err(|e| Status::internal(format!("list provider refresh states failed: {e}")))
 }
 
 pub async fn list_all_refresh_states(
     store: &Store,
 ) -> Result<Vec<StoredProviderCredentialRefreshState>, Status> {
-    let mut states = Vec::new();
-    let mut offset = 0;
-    loop {
-        let page = store
-            .list_all_messages::<StoredProviderCredentialRefreshState>(
-                REFRESH_WORKER_PAGE_SIZE,
-                offset,
-            )
-            .await
-            .map_err(|e| Status::internal(format!("list provider refresh states failed: {e}")))?;
-        if page.is_empty() {
-            break;
-        }
-        offset = offset
-            .checked_add(
-                u32::try_from(page.len())
-                    .map_err(|_| Status::internal("provider refresh page size exceeded u32"))?,
-            )
-            .ok_or_else(|| Status::internal("provider refresh pagination offset overflow"))?;
-        states.extend(page);
-    }
-    Ok(states)
+    store
+        .collect_messages(ObjectListQuery::AllWorkspaces)
+        .await
+        .map_err(|e| Status::internal(format!("list provider refresh states failed: {e}")))
 }
 
 pub async fn get_refresh_state(
@@ -237,10 +211,20 @@ pub async fn delete_refresh_state_with_credentials(
     provider_id: &str,
     credential_key: &str,
 ) -> Result<bool, Status> {
-    let Some(mut state) = get_refresh_state(store, workspace, provider_id, credential_key).await?
+    let Some(state) = get_refresh_state(store, workspace, provider_id, credential_key).await?
     else {
         return Ok(false);
     };
+    delete_observed_refresh_state_with_credentials(store, credentials, state).await?;
+    Ok(true)
+}
+
+/// Delete the observed refresh identity without resolving its name again.
+pub async fn delete_observed_refresh_state_with_credentials(
+    store: &Store,
+    credentials: &crate::credentials::CredentialRuntime,
+    mut state: StoredProviderCredentialRefreshState,
+) -> Result<(), Status> {
     let mut version = state
         .metadata
         .as_ref()
@@ -248,19 +232,33 @@ pub async fn delete_refresh_state_with_credentials(
     if state
         .metadata
         .as_ref()
-        .is_some_and(|metadata| metadata.deletion_timestamp_ms == 0)
+        .is_some_and(|metadata| metadata.deletion_time.is_none())
     {
         if let Some(metadata) = state.metadata.as_mut() {
-            metadata.deletion_timestamp_ms = current_time_ms();
+            metadata.deletion_time =
+                openshell_core::time::timestamp_from_millis(current_time_ms()).ok();
         }
         state.authorization_epoch = uuid::Uuid::new_v4().to_string();
         state.status = "deleting".to_string();
         state.next_refresh_at_ms = i64::MAX;
-        version = persist_refresh_state_if_current(store, &state, version)
-            .await?
-            .ok_or_else(|| {
-                Status::aborted("provider refresh was concurrently modified during deletion")
-            })?;
+        let Some(current_version) =
+            persist_refresh_state_if_current(store, &state, version).await?
+        else {
+            if store
+                .get_message::<StoredProviderCredentialRefreshState>(state.object_id())
+                .await
+                .map_err(|err| {
+                    Status::internal(format!("fetch provider refresh state failed: {err}"))
+                })?
+                .is_none()
+            {
+                return Ok(());
+            }
+            return Err(Status::aborted(
+                "provider refresh was concurrently modified during deletion",
+            ));
+        };
+        version = current_version;
         if let Some(metadata) = state.metadata.as_mut() {
             metadata.resource_version = version;
         }
@@ -285,7 +283,8 @@ pub async fn delete_refresh_state_with_credentials(
                 Status::aborted("provider refresh was concurrently modified during deletion")
             }
             other => Status::internal(format!("delete provider refresh state failed: {other}")),
-        })
+        })?;
+    Ok(())
 }
 
 pub async fn delete_refresh_states_for_provider_with_credentials(
@@ -320,14 +319,64 @@ pub fn refresh_status_from_state(
         credential_key: state.credential_key.clone(),
         strategy: state.strategy,
         status: state.status.clone(),
-        expires_at_ms: state.expires_at_ms,
-        next_refresh_at_ms: state.next_refresh_at_ms,
-        last_refresh_at_ms: state.last_refresh_at_ms,
+        expiration_time: if refresh_has_expiration(state) {
+            openshell_core::time::timestamp_from_millis(state.expires_at_ms).ok()
+        } else {
+            None
+        },
+        next_refresh_time: if state.next_refresh_at_ms == i64::MAX {
+            None
+        } else {
+            openshell_core::time::optional_timestamp_from_legacy_millis(state.next_refresh_at_ms)
+                .ok()
+                .flatten()
+        },
+        last_refresh_time: openshell_core::time::optional_timestamp_from_legacy_millis(
+            state.last_refresh_at_ms,
+        )
+        .ok()
+        .flatten(),
         last_error: state.last_error.clone(),
         recovery_action: state.recovery_action,
         failure_code: state.failure_code.clone(),
         provider_error_subtype: state.provider_error_subtype.clone(),
-        last_error_at_ms: state.last_error_at_ms,
+        last_error_time: openshell_core::time::optional_timestamp_from_legacy_millis(
+            state.last_error_at_ms,
+        )
+        .ok()
+        .flatten(),
+    }
+}
+
+/// Whether a refresh expiration was explicitly provided.
+///
+/// Legacy records infer presence from a nonzero millisecond value. New records
+/// use a private metadata annotation only for the ambiguous Unix epoch value so
+/// the frozen storage protobuf schema does not need to change.
+pub fn refresh_has_expiration(state: &StoredProviderCredentialRefreshState) -> bool {
+    state.expires_at_ms != 0
+        || state.metadata.as_ref().is_some_and(|metadata| {
+            metadata
+                .annotations
+                .get(EXPIRATION_PRESENT_ANNOTATION)
+                .is_some_and(|value| value == "true")
+        })
+}
+
+pub fn set_refresh_expiration_presence(
+    state: &mut StoredProviderCredentialRefreshState,
+    present: bool,
+) {
+    let Some(metadata) = state.metadata.as_mut() else {
+        return;
+    };
+    if present && state.expires_at_ms == 0 {
+        metadata.annotations.insert(
+            EXPIRATION_PRESENT_ANNOTATION.to_string(),
+            "true".to_string(),
+        );
+    } else {
+        metadata.annotations.remove(EXPIRATION_PRESENT_ANNOTATION);
     }
 }
 
@@ -338,8 +387,8 @@ pub struct NewRefreshStateConfig {
     pub expires_at_ms: i64,
     pub token_url: String,
     pub scopes: Vec<String>,
-    pub refresh_before_seconds: i64,
-    pub max_lifetime_seconds: i64,
+    pub refresh_before: Option<prost_types::Duration>,
+    pub max_lifetime: Option<prost_types::Duration>,
     /// Resolved semantic output id -> concrete env key for credentials this
     /// refresh co-mints beyond its primary. Pinned from the profile's
     /// `additional_outputs` at configure time.
@@ -353,25 +402,34 @@ pub fn new_refresh_state(
     credential_key: &str,
     config: NewRefreshStateConfig,
 ) -> Result<StoredProviderCredentialRefreshState, Status> {
+    if let Some(value) = config.refresh_before.as_ref() {
+        openshell_core::time::duration_to_std(value)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+    }
+    if let Some(value) = config.max_lifetime.as_ref() {
+        let duration = openshell_core::time::duration_to_std(value)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        if duration.is_zero() {
+            return Err(Status::invalid_argument(
+                "max_lifetime must be greater than zero when present",
+            ));
+        }
+    }
     let provider_id = provider.object_id().to_string();
     let provider_name = provider.object_name().to_string();
     let now_ms = current_time_ms();
-    let next_refresh_at_ms = next_refresh_at_ms(
-        config.expires_at_ms,
-        config.refresh_before_seconds,
-        config.max_lifetime_seconds,
-        now_ms,
-    );
+    let next_refresh_at_ms =
+        next_refresh_at_ms(config.expires_at_ms, config.refresh_before.as_ref());
     Ok(StoredProviderCredentialRefreshState {
         metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
             id: uuid::Uuid::new_v4().to_string(),
             name: refresh_state_name(&provider_id, credential_key),
-            created_at_ms: now_ms,
+            created_time: openshell_core::time::timestamp_from_millis(now_ms).ok(),
             labels: HashMap::new(),
             resource_version: 0,
             annotations: HashMap::new(),
             workspace: workspace.to_string(),
-            deletion_timestamp_ms: 0,
+            deletion_time: None,
         }),
         provider_id,
         provider_name,
@@ -386,8 +444,8 @@ pub fn new_refresh_state(
         last_error: String::new(),
         token_url: config.token_url,
         scopes: config.scopes,
-        refresh_before_seconds: config.refresh_before_seconds,
-        max_lifetime_seconds: config.max_lifetime_seconds,
+        refresh_before: config.refresh_before,
+        max_lifetime: config.max_lifetime,
         additional_output_keys: config.additional_output_keys,
         authorization_epoch: uuid::Uuid::new_v4().to_string(),
         secret_material_handles: HashMap::new(),
@@ -551,19 +609,37 @@ struct GoogleServiceAccountClaims<'a> {
 
 pub fn next_refresh_at_ms(
     expires_at_ms: i64,
-    refresh_before_seconds: i64,
-    _max_lifetime_seconds: i64,
-    _now_ms: i64,
+    refresh_before: Option<&prost_types::Duration>,
 ) -> i64 {
-    let refresh_before_seconds = if refresh_before_seconds > 0 {
-        refresh_before_seconds
-    } else {
-        DEFAULT_REFRESH_BEFORE_SECONDS
-    };
+    let refresh_before = refresh_before
+        .and_then(|value| openshell_core::time::duration_to_std(value).ok())
+        .unwrap_or_else(|| {
+            Duration::from_secs(u64::try_from(DEFAULT_REFRESH_BEFORE_SECONDS).unwrap_or(u64::MAX))
+        });
+    let refresh_before_ms = refresh_before.as_millis().saturating_add(u128::from(
+        !refresh_before.subsec_nanos().is_multiple_of(1_000_000),
+    ));
+    let refresh_before_ms = i64::try_from(refresh_before_ms).unwrap_or(i64::MAX);
     if expires_at_ms > 0 {
-        return expires_at_ms.saturating_sub(refresh_before_seconds.saturating_mul(1000));
+        return expires_at_ms.saturating_sub(refresh_before_ms);
     }
     0
+}
+
+// OAuth/JWT expiry fields use whole seconds. Round an exact positive profile
+// duration up only at that protocol boundary so a fractional lifetime never
+// collapses into the absent/default sentinel.
+fn max_lifetime_seconds(state: &StoredProviderCredentialRefreshState) -> i64 {
+    let Some(value) = state.max_lifetime.as_ref() else {
+        return DEFAULT_MAX_LIFETIME_SECONDS;
+    };
+    let Ok(duration) = openshell_core::time::duration_to_std(value) else {
+        return DEFAULT_MAX_LIFETIME_SECONDS;
+    };
+    let seconds = duration
+        .as_secs()
+        .saturating_add(u64::from(duration.subsec_nanos() != 0));
+    i64::try_from(seconds).unwrap_or(i64::MAX).max(1)
 }
 
 fn seconds_until_ms(now_ms: i64, target_ms: i64) -> i64 {
@@ -790,7 +866,7 @@ pub async fn refresh_provider_credential(
     if state
         .metadata
         .as_ref()
-        .is_some_and(|metadata| metadata.deletion_timestamp_ms != 0)
+        .is_some_and(|metadata| metadata.deletion_time.is_some())
     {
         return Err(Status::failed_precondition(
             "provider refresh is being deleted",
@@ -834,23 +910,6 @@ pub async fn refresh_provider_credential(
         next_refresh_at_ms = state.next_refresh_at_ms,
         "provider credential refresh started"
     );
-
-    // Enforce the providers_v2 gate on every mint, not just at configure time.
-    // Otherwise disabling providers_v2_enabled leaves already-configured refresh
-    // states that the worker and manual rotation keep minting from.
-    if let Err(err) = ensure_refresh_providers_v2_gate(store, &state).await {
-        let failure = RefreshFailure::from_status(&err);
-        persist_refresh_failure_state(store, &mut state, expected_version, &failure).await?;
-        warn!(
-            provider = %state.provider_name,
-            credential_key = %state.credential_key,
-            strategy = %refresh_strategy_name(state.strategy),
-            status = %state.status,
-            error = %err,
-            "provider credential refresh gate rejected"
-        );
-        return Err(err);
-    }
 
     let mint_result = match resolve_refresh_material(Some(credentials), &state).await {
         Ok(transient_state) => mint_credential(&transient_state).await,
@@ -932,12 +991,9 @@ pub async fn refresh_provider_credential(
                 state.material.remove("refresh_token");
             }
             state.expires_at_ms = minted.expires_at_ms;
-            state.next_refresh_at_ms = next_refresh_at_ms(
-                minted.expires_at_ms,
-                state.refresh_before_seconds,
-                state.max_lifetime_seconds,
-                now_ms,
-            );
+            set_refresh_expiration_presence(&mut state, true);
+            state.next_refresh_at_ms =
+                next_refresh_at_ms(minted.expires_at_ms, state.refresh_before.as_ref());
             state.last_refresh_at_ms = now_ms;
             state.status = "refreshed".to_string();
             state.last_error.clear();
@@ -1149,21 +1205,33 @@ async fn apply_minted_credential(
         }
         None
     };
-    if minted.expires_at_ms > 0 {
+    let credential_expiration_time =
+        openshell_core::time::optional_timestamp_from_legacy_millis(minted.expires_at_ms)
+            .map_err(|error| Status::internal(error.to_string()))?;
+    if let Some(expiration_time) = credential_expiration_time.as_ref() {
         updated
-            .credential_expires_at_ms
-            .insert(credential_key.to_string(), minted.expires_at_ms);
+            .credential_expiration_times
+            .insert(credential_key.to_string(), *expiration_time);
         for key in minted.additional_credentials.keys() {
             updated
-                .credential_expires_at_ms
-                .insert(key.clone(), minted.expires_at_ms);
+                .credential_expiration_times
+                .insert(key.clone(), *expiration_time);
         }
     } else {
-        updated.credential_expires_at_ms.remove(credential_key);
+        updated.credential_expiration_times.remove(credential_key);
         for key in minted.additional_credentials.keys() {
-            updated.credential_expires_at_ms.remove(key);
+            updated.credential_expiration_times.remove(key);
         }
     }
+    // Acquire the shared sandbox mutation boundary only around validation and
+    // persistence, after any remote minting or credential staging. This
+    // prevents route status from committing against the old provider revision
+    // after the rotation writes, without holding the guard across network I/O.
+    let _sandbox_sync_guard = if let Some(compute) = compute {
+        Some(compute.sandbox_sync_guard().await)
+    } else {
+        None
+    };
     if let Err(err) = crate::grpc::provider::validate_provider_update_against_attached_sandboxes(
         store, workspace, &updated,
     )
@@ -1202,19 +1270,19 @@ async fn apply_minted_credential(
                     current.credentials.insert(key.clone(), value.clone());
                 }
             }
-            if minted.expires_at_ms > 0 {
+            if let Some(expiration_time) = credential_expiration_time.as_ref() {
                 current
-                    .credential_expires_at_ms
-                    .insert(credential_key.to_string(), minted.expires_at_ms);
+                    .credential_expiration_times
+                    .insert(credential_key.to_string(), *expiration_time);
                 for key in minted.additional_credentials.keys() {
                     current
-                        .credential_expires_at_ms
-                        .insert(key.clone(), minted.expires_at_ms);
+                        .credential_expiration_times
+                        .insert(key.clone(), *expiration_time);
                 }
             } else {
-                current.credential_expires_at_ms.remove(credential_key);
+                current.credential_expiration_times.remove(credential_key);
                 for key in minted.additional_credentials.keys() {
-                    current.credential_expires_at_ms.remove(key);
+                    current.credential_expiration_times.remove(key);
                 }
             }
         })
@@ -1276,31 +1344,6 @@ async fn cleanup_staged_refresh_handles(
     }
 }
 
-/// Reject minting for strategies that require `providers_v2_enabled` when the
-/// setting is off. Runs on every refresh (worker sweep and manual rotation), so
-/// disabling the setting halts further mints from already-configured states.
-async fn ensure_refresh_providers_v2_gate(
-    store: &Store,
-    state: &StoredProviderCredentialRefreshState,
-) -> Result<(), Status> {
-    let strategy = ProviderCredentialRefreshStrategy::try_from(state.strategy)
-        .unwrap_or(ProviderCredentialRefreshStrategy::Unspecified);
-    if strategy != ProviderCredentialRefreshStrategy::AwsStsAssumeRole {
-        return Ok(());
-    }
-    if !crate::grpc::policy::global_bool_setting_enabled(
-        store,
-        openshell_core::settings::PROVIDERS_V2_ENABLED_KEY,
-    )
-    .await?
-    {
-        return Err(Status::failed_precondition(
-            "aws_sts_assume_role requires providers_v2_enabled=true",
-        ));
-    }
-    Ok(())
-}
-
 async fn mint_credential(
     state: &StoredProviderCredentialRefreshState,
 ) -> Result<MintedCredential, RefreshFailure> {
@@ -1350,7 +1393,7 @@ async fn mint_oauth2_refresh_token(
     request_token(
         &token_url,
         &form,
-        state.max_lifetime_seconds,
+        max_lifetime_seconds(state),
         OAuthGrantKind::UserRefreshToken,
     )
     .await
@@ -1375,7 +1418,7 @@ async fn mint_oauth2_client_credentials(
     request_token(
         &token_url,
         &form,
-        state.max_lifetime_seconds,
+        max_lifetime_seconds(state),
         OAuthGrantKind::NonInteractive,
     )
     .await
@@ -1397,11 +1440,7 @@ async fn mint_google_service_account_jwt(
     }
     let now_ms = current_time_ms();
     let now_secs = now_ms / 1000;
-    let lifetime_secs = if state.max_lifetime_seconds > 0 {
-        state.max_lifetime_seconds.min(DEFAULT_MAX_LIFETIME_SECONDS)
-    } else {
-        DEFAULT_MAX_LIFETIME_SECONDS
-    };
+    let lifetime_secs = max_lifetime_seconds(state).min(DEFAULT_MAX_LIFETIME_SECONDS);
     let subject = material_value(&state.material, &["subject", "sub"]);
     let claims = GoogleServiceAccountClaims {
         iss: &client_email,
@@ -1411,7 +1450,7 @@ async fn mint_google_service_account_jwt(
         exp: now_secs.saturating_add(lifetime_secs),
         sub: subject.as_deref(),
     };
-    let assertion = jsonwebtoken::encode(
+    let assertion = openshell_crypto::jwt::encode(
         &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256),
         &claims,
         &jsonwebtoken::EncodingKey::from_rsa_pem(private_key.as_bytes()).map_err(|_| {
@@ -1498,11 +1537,7 @@ async fn mint_aws_sts_assume_role(
     };
     let client = aws_sdk_sts::Client::from_conf(sts_config);
 
-    let max_lifetime_i64 = if state.max_lifetime_seconds > 0 {
-        state.max_lifetime_seconds
-    } else {
-        DEFAULT_MAX_LIFETIME_SECONDS
-    };
+    let max_lifetime_i64 = max_lifetime_seconds(state);
     let max_lifetime = i32::try_from(max_lifetime_i64.min(i64::from(i32::MAX))).unwrap_or(i32::MAX);
     let max_lifetime_ms = i64::from(max_lifetime).saturating_mul(1000);
 
@@ -1579,6 +1614,7 @@ async fn request_token(
         }
     }
 
+    openshell_crypto::tls::ensure_default_provider();
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
@@ -1880,11 +1916,11 @@ pub fn spawn_refresh_worker(state: std::sync::Arc<crate::ServerState>, interval:
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
-            if let Err(err) = run_refresh_worker_tick(
+            if let Err(err) = Box::pin(run_refresh_worker_tick(
                 state.store.as_ref(),
                 Some(&state.credentials),
                 Some(&state.compute),
-            )
+            ))
             .await
             {
                 warn!(error = %err, "provider credential refresh worker tick failed");
@@ -1931,7 +1967,7 @@ async fn run_refresh_worker_tick(
         if state
             .metadata
             .as_ref()
-            .is_some_and(|metadata| metadata.deletion_timestamp_ms != 0)
+            .is_some_and(|metadata| metadata.deletion_time.is_some())
         {
             let Some(credentials) = credentials else {
                 warn!(
@@ -2051,24 +2087,54 @@ mod tests {
         RefreshRetrySchedule, Status, classify_oauth_token_error,
         delete_refresh_state_with_credentials, effective_authorization_epoch,
         enqueue_pending_secret_deletion, get_refresh_state, list_all_refresh_states,
-        list_refresh_states_for_provider, new_refresh_state, put_refresh_state,
-        read_bounded_oauth_error_body, refresh_material_scope, refresh_provider_credential,
-        refresh_state_name, refresh_strategy_name, run_refresh_worker_tick, seconds_until_ms,
+        list_refresh_states_for_provider, max_lifetime_seconds, new_refresh_state,
+        next_refresh_at_ms, put_refresh_state, read_bounded_oauth_error_body,
+        refresh_has_expiration, refresh_material_scope, refresh_provider_credential,
+        refresh_state_name, refresh_status_from_state, refresh_strategy_name,
+        run_refresh_worker_tick, seconds_until_ms, set_refresh_expiration_presence,
         validate_secret_material_references,
     };
     use crate::credentials::CredentialRuntime;
     use crate::persistence::{current_time_ms, test_store};
+    use crate::storage_proto::StoredProviderCredentialRefreshStateV2 as StoredProviderCredentialRefreshState;
+
+    fn proto_duration(seconds: i64) -> prost_types::Duration {
+        prost_types::Duration { seconds, nanos: 0 }
+    }
+
+    #[test]
+    fn exact_refresh_durations_preserve_fractional_values_until_protocol_boundaries() {
+        let refresh_before = prost_types::Duration {
+            seconds: 0,
+            nanos: 500_000_000,
+        };
+        assert_eq!(next_refresh_at_ms(10_000, Some(&refresh_before)), 9_500);
+        let submillisecond = prost_types::Duration {
+            seconds: 0,
+            nanos: 1,
+        };
+        assert_eq!(next_refresh_at_ms(10_000, Some(&submillisecond)), 9_999);
+
+        let state = StoredProviderCredentialRefreshState {
+            max_lifetime: Some(refresh_before),
+            ..Default::default()
+        };
+        assert_eq!(max_lifetime_seconds(&state), 1);
+    }
     use openshell_core::Config;
     use openshell_core::proto::datamodel::v1::ObjectMeta;
     use openshell_core::proto::{
         CredentialHandle, Provider, ProviderCredentialRefreshRecoveryAction,
         ProviderCredentialRefreshStrategy, Sandbox, SandboxSpec,
-        StoredProviderCredentialRefreshState,
     };
     use openshell_core::{ObjectId, ObjectName, ObjectWorkspace};
     use std::collections::HashMap;
     use wiremock::matchers::{body_string_contains, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn ts(milliseconds: i64) -> prost_types::Timestamp {
+        openshell_core::time::timestamp_from_millis(milliseconds).unwrap()
+    }
 
     fn test_credentials() -> CredentialRuntime {
         CredentialRuntime::from_config(&Config::new(None).with_credential_drivers(["test-static"]))
@@ -2136,8 +2202,8 @@ mod tests {
             expires_at_ms: 0,
             token_url: "https://issuer.example/token".to_string(),
             scopes: vec!["scope".to_string()],
-            refresh_before_seconds: 300,
-            max_lifetime_seconds: 3600,
+            refresh_before: Some(proto_duration(300)),
+            max_lifetime: Some(proto_duration(3600)),
             additional_output_keys: HashMap::new(),
         };
         let first = new_refresh_state(&provider, "default", "ACCESS_TOKEN", config())
@@ -2177,6 +2243,33 @@ mod tests {
             "google_service_account_jwt"
         );
         assert_eq!(refresh_strategy_name(i32::MAX), "unspecified");
+    }
+
+    #[test]
+    fn refresh_expiration_presence_distinguishes_absent_epoch_and_legacy_values() {
+        let mut state = StoredProviderCredentialRefreshState {
+            metadata: Some(ObjectMeta::default()),
+            ..Default::default()
+        };
+        assert!(!refresh_has_expiration(&state));
+        assert!(refresh_status_from_state(&state).expiration_time.is_none());
+
+        set_refresh_expiration_presence(&mut state, true);
+        assert!(refresh_has_expiration(&state));
+        assert_eq!(
+            refresh_status_from_state(&state).expiration_time,
+            Some(ts(0))
+        );
+
+        set_refresh_expiration_presence(&mut state, false);
+        assert!(!refresh_has_expiration(&state));
+
+        state.expires_at_ms = 1;
+        assert!(refresh_has_expiration(&state));
+        assert_eq!(
+            refresh_status_from_state(&state).expiration_time,
+            Some(ts(1))
+        );
     }
 
     #[test]
@@ -2443,6 +2536,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
+        openshell_crypto::tls::ensure_default_provider();
         let response = reqwest::get(format!("{}/oversized", mock_server.uri()))
             .await
             .unwrap();
@@ -2477,8 +2571,8 @@ mod tests {
                 expires_at_ms: 0,
                 token_url: "not-an-absolute-url".to_string(),
                 scopes: Vec::new(),
-                refresh_before_seconds: 30,
-                max_lifetime_seconds: 60,
+                refresh_before: Some(proto_duration(30)),
+                max_lifetime: Some(proto_duration(60)),
                 additional_output_keys: HashMap::new(),
             },
         )
@@ -2506,62 +2600,6 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
-        assert_eq!(stored.status, "configuration_required");
-        assert_eq!(
-            stored.recovery_action,
-            ProviderCredentialRefreshRecoveryAction::FixConfiguration as i32
-        );
-        assert_eq!(stored.failure_code, "refresh_configuration_invalid");
-        assert_eq!(
-            stored.next_refresh_at_ms - stored.last_error_at_ms,
-            60 * 60 * 1000
-        );
-    }
-
-    #[tokio::test]
-    async fn disabled_provider_gate_requires_configuration_and_retries_hourly() {
-        let store = test_store().await;
-        let provider = provider("disabled-provider-gate", "aws-s3");
-        store.put_message(&provider).await.unwrap();
-        let state = new_refresh_state(
-            &provider,
-            "default",
-            "AWS_ACCESS_KEY_ID",
-            NewRefreshStateConfig {
-                strategy: ProviderCredentialRefreshStrategy::AwsStsAssumeRole,
-                material: HashMap::from([(
-                    "role_arn".to_string(),
-                    "arn:aws:iam::123456789012:role/test".to_string(),
-                )]),
-                secret_material_keys: Vec::new(),
-                expires_at_ms: 0,
-                token_url: String::new(),
-                scopes: Vec::new(),
-                refresh_before_seconds: 30,
-                max_lifetime_seconds: 60,
-                additional_output_keys: HashMap::new(),
-            },
-        )
-        .unwrap();
-        put_refresh_state(&store, &state).await.unwrap();
-
-        let err = refresh_provider_credential(
-            &store,
-            "default",
-            &test_credentials(),
-            None,
-            "disabled-provider-gate",
-            "AWS_ACCESS_KEY_ID",
-        )
-        .await
-        .unwrap_err();
-
-        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
-        let stored =
-            get_refresh_state(&store, "default", provider.object_id(), "AWS_ACCESS_KEY_ID")
-                .await
-                .unwrap()
-                .unwrap();
         assert_eq!(stored.status, "configuration_required");
         assert_eq!(
             stored.recovery_action,
@@ -2607,8 +2645,8 @@ mod tests {
                 expires_at_ms: 0,
                 token_url: format!("{}/token", mock_server.uri()),
                 scopes: Vec::new(),
-                refresh_before_seconds: 30,
-                max_lifetime_seconds: 60,
+                refresh_before: Some(proto_duration(30)),
+                max_lifetime: Some(proto_duration(60)),
                 additional_output_keys: HashMap::new(),
             },
         )
@@ -2685,8 +2723,8 @@ mod tests {
                 expires_at_ms: 0,
                 token_url: format!("{}/token", mock_server.uri()),
                 scopes: vec!["https://graph.microsoft.com/.default".to_string()],
-                refresh_before_seconds: 30,
-                max_lifetime_seconds: 60,
+                refresh_before: Some(proto_duration(30)),
+                max_lifetime: Some(proto_duration(60)),
             },
         )
         .unwrap();
@@ -2738,8 +2776,10 @@ mod tests {
             Some(&"minted-graph-token".to_string())
         );
         assert_eq!(
-            stored.credential_expires_at_ms.get("MS_GRAPH_ACCESS_TOKEN"),
-            Some(&refreshed.expires_at_ms)
+            stored
+                .credential_expiration_times
+                .get("MS_GRAPH_ACCESS_TOKEN"),
+            Some(&ts(refreshed.expires_at_ms))
         );
     }
 
@@ -2773,8 +2813,8 @@ mod tests {
                 expires_at_ms: 0,
                 token_url: format!("{}/token", mock_server.uri()),
                 scopes: Vec::new(),
-                refresh_before_seconds: 30,
-                max_lifetime_seconds: 60,
+                refresh_before: Some(proto_duration(30)),
+                max_lifetime: Some(proto_duration(60)),
                 additional_output_keys: HashMap::new(),
             },
         )
@@ -2833,8 +2873,10 @@ mod tests {
             .unwrap();
         assert_eq!(handle.driver, "test-static");
         assert_eq!(
-            stored.credential_expires_at_ms.get("MS_GRAPH_ACCESS_TOKEN"),
-            Some(&refreshed.expires_at_ms)
+            stored
+                .credential_expiration_times
+                .get("MS_GRAPH_ACCESS_TOKEN"),
+            Some(&ts(refreshed.expires_at_ms))
         );
 
         let resolved = credentials
@@ -2874,12 +2916,12 @@ mod tests {
                 metadata: Some(ObjectMeta {
                     id: "sandbox-collision".to_string(),
                     name: "collision".to_string(),
-                    created_at_ms: 1,
+                    created_time: openshell_core::time::timestamp_from_millis(1).ok(),
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 spec: Some(SandboxSpec {
                     providers: vec!["existing-graph".to_string(), "refreshing-graph".to_string()],
@@ -2904,8 +2946,8 @@ mod tests {
                 expires_at_ms: 0,
                 token_url: format!("{}/token", mock_server.uri()),
                 scopes: Vec::new(),
-                refresh_before_seconds: 30,
-                max_lifetime_seconds: 60,
+                refresh_before: Some(proto_duration(30)),
+                max_lifetime: Some(proto_duration(60)),
             },
         )
         .unwrap();
@@ -2995,8 +3037,8 @@ mod tests {
                 expires_at_ms: 0,
                 token_url: format!("{}/token", mock_server.uri()),
                 scopes: vec!["https://graph.microsoft.com/.default".to_string()],
-                refresh_before_seconds: 30,
-                max_lifetime_seconds: 60,
+                refresh_before: Some(proto_duration(30)),
+                max_lifetime: Some(proto_duration(60)),
             },
         )
         .unwrap();
@@ -3036,9 +3078,9 @@ mod tests {
         );
         assert_eq!(
             stored_provider
-                .credential_expires_at_ms
+                .credential_expiration_times
                 .get("MS_GRAPH_ACCESS_TOKEN"),
-            Some(&refreshed.expires_at_ms)
+            Some(&ts(refreshed.expires_at_ms))
         );
 
         let stored_state = get_refresh_state(
@@ -3112,8 +3154,8 @@ mod tests {
                 expires_at_ms: 0,
                 token_url: format!("{}/token", mock_server.uri()),
                 scopes: Vec::new(),
-                refresh_before_seconds: 30,
-                max_lifetime_seconds: 60,
+                refresh_before: Some(proto_duration(30)),
+                max_lifetime: Some(proto_duration(60)),
                 additional_output_keys: HashMap::new(),
             },
         )
@@ -3205,8 +3247,8 @@ mod tests {
                 expires_at_ms: 0,
                 token_url: format!("{}/token", mock_server.uri()),
                 scopes: Vec::new(),
-                refresh_before_seconds: 30,
-                max_lifetime_seconds: 60,
+                refresh_before: Some(proto_duration(30)),
+                max_lifetime: Some(proto_duration(60)),
                 additional_output_keys: HashMap::new(),
             },
         )
@@ -3315,8 +3357,8 @@ mod tests {
                 expires_at_ms: 0,
                 token_url: format!("{}/token", mock_server.uri()),
                 scopes: vec!["https://www.googleapis.com/auth/drive.readonly".to_string()],
-                refresh_before_seconds: 300,
-                max_lifetime_seconds: 3600,
+                refresh_before: Some(proto_duration(300)),
+                max_lifetime: Some(proto_duration(3600)),
             },
         )
         .unwrap();
@@ -3368,14 +3410,16 @@ mod tests {
                 expires_at_ms: 0,
                 token_url: String::new(),
                 scopes: Vec::new(),
-                refresh_before_seconds: 0,
-                max_lifetime_seconds: 0,
+                refresh_before: None,
+                max_lifetime: None,
             },
         )
         .unwrap();
         put_refresh_state(&store, &state).await.unwrap();
 
-        run_refresh_worker_tick(&store, None, None).await.unwrap();
+        Box::pin(run_refresh_worker_tick(&store, None, None))
+            .await
+            .unwrap();
 
         let stored_state = get_refresh_state(
             &store,
@@ -3417,8 +3461,8 @@ mod tests {
                 expires_at_ms: 0,
                 token_url: "https://issuer.example/token".to_string(),
                 scopes: Vec::new(),
-                refresh_before_seconds: 30,
-                max_lifetime_seconds: 60,
+                refresh_before: Some(proto_duration(30)),
+                max_lifetime: Some(proto_duration(60)),
                 additional_output_keys: HashMap::new(),
             },
         )
@@ -3431,9 +3475,13 @@ mod tests {
         state.next_refresh_at_ms = i64::MAX;
         put_refresh_state(&store, &state).await.unwrap();
 
-        run_refresh_worker_tick(&store, Some(&test_credentials()), None)
-            .await
-            .unwrap();
+        Box::pin(run_refresh_worker_tick(
+            &store,
+            Some(&test_credentials()),
+            None,
+        ))
+        .await
+        .unwrap();
 
         let stored = get_refresh_state(
             &store,
@@ -3470,8 +3518,8 @@ mod tests {
                 expires_at_ms: 0,
                 token_url: "https://issuer.example/token".to_string(),
                 scopes: Vec::new(),
-                refresh_before_seconds: 30,
-                max_lifetime_seconds: 60,
+                refresh_before: Some(proto_duration(30)),
+                max_lifetime: Some(proto_duration(60)),
                 additional_output_keys: HashMap::new(),
             },
         )
@@ -3486,12 +3534,13 @@ mod tests {
             .await
             .unwrap();
         state.material.clear();
-        state.metadata.as_mut().unwrap().deletion_timestamp_ms = current_time_ms();
+        state.metadata.as_mut().unwrap().deletion_time =
+            openshell_core::time::timestamp_from_millis(current_time_ms()).ok();
         state.status = "deleting".to_string();
         put_refresh_state(&store, &state).await.unwrap();
         assert_eq!(credentials.stored_credential_count(), Some(1));
 
-        run_refresh_worker_tick(&store, Some(&credentials), None)
+        Box::pin(run_refresh_worker_tick(&store, Some(&credentials), None))
             .await
             .unwrap();
 
@@ -3519,7 +3568,9 @@ mod tests {
         let store = test_store().await;
 
         let traced = test_exporter::install_traced();
-        run_refresh_worker_tick(&store, None, None).await.unwrap();
+        Box::pin(run_refresh_worker_tick(&store, None, None))
+            .await
+            .unwrap();
 
         let spans = traced.finished_spans();
         let root = spans
@@ -3590,13 +3641,6 @@ mod tests {
             .await;
 
         let store = test_store().await;
-        crate::grpc::policy::set_global_bool_setting_for_test(
-            &store,
-            openshell_core::settings::PROVIDERS_V2_ENABLED_KEY,
-            true,
-        )
-        .await
-        .unwrap();
         let prov = provider("aws-sts-test", "aws");
         store.put_message(&prov).await.unwrap();
 
@@ -3630,8 +3674,8 @@ mod tests {
                 expires_at_ms: 0,
                 token_url: String::new(),
                 scopes: Vec::new(),
-                refresh_before_seconds: 300,
-                max_lifetime_seconds: 3600,
+                refresh_before: Some(proto_duration(300)),
+                max_lifetime: Some(proto_duration(3600)),
             },
         )
         .unwrap();
@@ -3695,13 +3739,6 @@ mod tests {
             .await;
 
         let store = test_store().await;
-        crate::grpc::policy::set_global_bool_setting_for_test(
-            &store,
-            openshell_core::settings::PROVIDERS_V2_ENABLED_KEY,
-            true,
-        )
-        .await
-        .unwrap();
         let prov = provider("aws-sts-custom", "aws");
         store.put_message(&prov).await.unwrap();
 
@@ -3733,8 +3770,8 @@ mod tests {
                 expires_at_ms: 0,
                 token_url: String::new(),
                 scopes: Vec::new(),
-                refresh_before_seconds: 300,
-                max_lifetime_seconds: 3600,
+                refresh_before: Some(proto_duration(300)),
+                max_lifetime: Some(proto_duration(3600)),
             },
         )
         .unwrap();
@@ -3779,13 +3816,6 @@ mod tests {
     #[tokio::test]
     async fn aws_sts_mint_rejects_partial_source_credentials() {
         let store = test_store().await;
-        crate::grpc::policy::set_global_bool_setting_for_test(
-            &store,
-            openshell_core::settings::PROVIDERS_V2_ENABLED_KEY,
-            true,
-        )
-        .await
-        .unwrap();
         let prov = provider("aws-sts-partial", "aws");
         store.put_message(&prov).await.unwrap();
 
@@ -3815,8 +3845,8 @@ mod tests {
                 expires_at_ms: 0,
                 token_url: String::new(),
                 scopes: Vec::new(),
-                refresh_before_seconds: 300,
-                max_lifetime_seconds: 3600,
+                refresh_before: Some(proto_duration(300)),
+                max_lifetime: Some(proto_duration(3600)),
             },
         )
         .unwrap();
@@ -3900,16 +3930,18 @@ mod tests {
             Some(&"FwoGZXIvYXdzEBYaDH...EXAMPLETOKEN".to_string())
         );
         assert_eq!(
-            stored.credential_expires_at_ms.get("AWS_ACCESS_KEY_ID"),
-            Some(&4_000_000_000_000)
+            stored.credential_expiration_times.get("AWS_ACCESS_KEY_ID"),
+            Some(&ts(4_000_000_000_000))
         );
         assert_eq!(
-            stored.credential_expires_at_ms.get("AWS_SECRET_ACCESS_KEY"),
-            Some(&4_000_000_000_000)
+            stored
+                .credential_expiration_times
+                .get("AWS_SECRET_ACCESS_KEY"),
+            Some(&ts(4_000_000_000_000))
         );
         assert_eq!(
-            stored.credential_expires_at_ms.get("AWS_SESSION_TOKEN"),
-            Some(&4_000_000_000_000)
+            stored.credential_expiration_times.get("AWS_SESSION_TOKEN"),
+            Some(&ts(4_000_000_000_000))
         );
     }
 
@@ -4020,12 +4052,12 @@ mod tests {
                 metadata: Some(ObjectMeta {
                     id: "sandbox-aws-collision".to_string(),
                     name: "aws-collision".to_string(),
-                    created_at_ms: 1,
+                    created_time: openshell_core::time::timestamp_from_millis(1).ok(),
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: "default".to_string(),
-                    deletion_timestamp_ms: 0,
+                    deletion_time: None,
                 }),
                 spec: Some(SandboxSpec {
                     providers: vec!["existing-aws".to_string(), "refreshing-aws".to_string()],
@@ -4110,13 +4142,6 @@ mod tests {
             .await;
 
         let store = test_store().await;
-        crate::grpc::policy::set_global_bool_setting_for_test(
-            &store,
-            openshell_core::settings::PROVIDERS_V2_ENABLED_KEY,
-            true,
-        )
-        .await
-        .unwrap();
         let prov = provider("aws-sts-session", "aws");
         store.put_message(&prov).await.unwrap();
 
@@ -4157,8 +4182,8 @@ mod tests {
                 expires_at_ms: 0,
                 token_url: String::new(),
                 scopes: Vec::new(),
-                refresh_before_seconds: 300,
-                max_lifetime_seconds: 3600,
+                refresh_before: Some(proto_duration(300)),
+                max_lifetime: Some(proto_duration(3600)),
             },
         )
         .unwrap();
@@ -4194,13 +4219,6 @@ mod tests {
     #[tokio::test]
     async fn aws_sts_mint_rejects_session_token_without_source_pair() {
         let store = test_store().await;
-        crate::grpc::policy::set_global_bool_setting_for_test(
-            &store,
-            openshell_core::settings::PROVIDERS_V2_ENABLED_KEY,
-            true,
-        )
-        .await
-        .unwrap();
         let prov = provider("aws-sts-lonesession", "aws");
         store.put_message(&prov).await.unwrap();
 
@@ -4231,8 +4249,8 @@ mod tests {
                 expires_at_ms: 0,
                 token_url: String::new(),
                 scopes: Vec::new(),
-                refresh_before_seconds: 300,
-                max_lifetime_seconds: 3600,
+                refresh_before: Some(proto_duration(300)),
+                max_lifetime: Some(proto_duration(3600)),
             },
         )
         .unwrap();
@@ -4251,6 +4269,55 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
         assert!(err.message().contains("aws_session_token requires"));
+    }
+
+    #[tokio::test]
+    async fn deletion_of_observed_refresh_preserves_same_name_replacement() {
+        use super::delete_observed_refresh_state_with_credentials;
+        use crate::persistence::ObjectType;
+        let store = test_store().await;
+        let original = StoredProviderCredentialRefreshState {
+            metadata: Some(ObjectMeta {
+                id: "original-id".into(),
+                name: "refresh-name".into(),
+                workspace: "default".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        store.put_message(&original).await.unwrap();
+        let observed = store
+            .get_message::<StoredProviderCredentialRefreshState>("original-id")
+            .await
+            .unwrap()
+            .unwrap();
+        store
+            .delete(
+                StoredProviderCredentialRefreshState::object_type(),
+                "original-id",
+            )
+            .await
+            .unwrap();
+        let mut replacement = original;
+        replacement.metadata.as_mut().unwrap().id = "replacement-id".into();
+        store.put_message(&replacement).await.unwrap();
+        let replacement = store
+            .get_message::<StoredProviderCredentialRefreshState>("replacement-id")
+            .await
+            .unwrap()
+            .unwrap();
+
+        delete_observed_refresh_state_with_credentials(&store, &test_credentials(), observed)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .get_message::<StoredProviderCredentialRefreshState>("replacement-id")
+                .await
+                .unwrap()
+                .unwrap(),
+            replacement
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -4279,13 +4346,6 @@ mod tests {
             .await;
 
         let store = test_store().await;
-        crate::grpc::policy::set_global_bool_setting_for_test(
-            &store,
-            openshell_core::settings::PROVIDERS_V2_ENABLED_KEY,
-            true,
-        )
-        .await
-        .unwrap();
         let prov = provider("aws-race", "aws");
         store.put_message(&prov).await.unwrap();
         let provider_id = prov.object_id().to_string();
@@ -4319,8 +4379,8 @@ mod tests {
                 expires_at_ms: 0,
                 token_url: String::new(),
                 scopes: Vec::new(),
-                refresh_before_seconds: 300,
-                max_lifetime_seconds: 3600,
+                refresh_before: Some(proto_duration(300)),
+                max_lifetime: Some(proto_duration(3600)),
             },
         )
         .unwrap();
@@ -4407,13 +4467,6 @@ mod tests {
             .await;
 
         let store = test_store().await;
-        crate::grpc::policy::set_global_bool_setting_for_test(
-            &store,
-            openshell_core::settings::PROVIDERS_V2_ENABLED_KEY,
-            true,
-        )
-        .await
-        .unwrap();
         let prov = provider("aws-superseded", "aws");
         store.put_message(&prov).await.unwrap();
         let provider_id = prov.object_id().to_string();
@@ -4447,8 +4500,8 @@ mod tests {
                 expires_at_ms: 0,
                 token_url: String::new(),
                 scopes: Vec::new(),
-                refresh_before_seconds: 300,
-                max_lifetime_seconds: 3600,
+                refresh_before: Some(proto_duration(300)),
+                max_lifetime: Some(proto_duration(3600)),
             },
         )
         .unwrap();
@@ -4512,17 +4565,17 @@ mod tests {
             metadata: Some(ObjectMeta {
                 id: format!("{name}-id"),
                 name: name.to_string(),
-                created_at_ms: 1,
+                created_time: openshell_core::time::timestamp_from_millis(1).ok(),
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
                 workspace: "default".to_string(),
-                deletion_timestamp_ms: 0,
+                deletion_time: None,
             }),
             r#type: provider_type.to_string(),
             credentials: HashMap::new(),
             config: HashMap::new(),
-            credential_expires_at_ms: HashMap::new(),
+            credential_expiration_times: HashMap::new(),
             profile_workspace: "default".to_string(),
             credential_handles: HashMap::new(),
         }
