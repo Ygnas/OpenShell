@@ -211,9 +211,12 @@ name = "openshell-crypto"
 version = "0.0.0"
 dependencies = [
  "jsonwebtoken",
+ "jsonwebtoken-openssl",
+ "openssl",
  "pem",
  "rcgen",
  "rustls",
+ "rustls-openssl",
  "serde",
  "thiserror",
 ]

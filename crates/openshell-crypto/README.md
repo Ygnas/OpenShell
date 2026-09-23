@@ -1,21 +1,21 @@
 # OpenShell crypto backend
 
-`openshell-crypto` owns first-party crypto backend selection. AWS-LC is the only
-production implementation. This change preserves TLS algorithms, Ed25519 gateway
-JWTs, P-256 certificate keys, native trust roots, and credential envelope formats.
-The interface is intended to support a system-OpenSSL backend for regulated
-deployments, related to [#900](https://github.com/NVIDIA/OpenShell/issues/900).
-AWS-LC remains the only production implementation. The standalone
-[OpenSSL PoC](../../examples/openssl-crypto-poc/README.md) validates the provider
-contracts separately; it is not a FIPS build or compliance claim.
+`openshell-crypto` owns first-party crypto backend selection. AWS-LC remains the
+default backend for upstream builds. The opt-in `openssl` feature provides a
+system-OpenSSL implementation of the same contract for regulated-build
+experimentation. This preserves TLS algorithms, Ed25519 gateway JWTs, P-256
+certificate keys, native trust roots, and credential envelope formats. The
+OpenSSL implementation is not a FIPS build or compliance claim; module,
+provider, host-policy, image, and operational-environment qualification remain
+separate work.
 
 ## Boundaries
 
 `CryptoBackend` defines randomness, incremental SHA-256, and AES-256-GCM without
 crypto-library types. `ProtocolBackend` adds Rustls, rcgen, and jsonwebtoken
 adapters. These adapters retain their protocol libraries' validation and encoding;
-they do not expose AWS-LC types. A later native OpenSSL TLS integration may need
-an additional transport adapter; this interface does not claim to provide one.
+they do not expose backend-specific crypto types. The OpenSSL backend supplies
+the Rustls provider and protocol adapters through the same interface.
 
 Digest creation, updates, and finalization return `Result` so backends can report
 provider and operation failures. Callers discard a digest after an update error;
@@ -36,9 +36,12 @@ depending on rcgen's compiled crypto implementation.
 
 ## Build selection
 
-The crate's default `aws-lc` feature selects the current implementation. The root
-workspace declares that choice once in its `openshell-crypto` dependency;
-application crates inherit it rather than choosing a backend independently.
+The crate's default `aws-lc` feature selects the upstream implementation. The
+`openssl` feature is selected with `--no-default-features --features openssl` in
+an isolated consumer or build harness. The two backend features are mutually
+exclusive. The root workspace continues to declare AWS-LC for ordinary product
+builds; product-wide OpenSSL feature propagation must be enabled explicitly by
+the eventual FIPS packaging path.
 Standalone examples select their own default through their path dependency.
 Disabling crate defaults removes its AWS-LC implementation and requires an
 explicit context before use; use without initialization fails closed with an
@@ -53,11 +56,12 @@ A second backend must adapt these integrations and the application startup path.
 Disabling this crate's feature alone does not remove dependency-owned crypto
 from the entire product graph.
 
-The later OpenSSL build must use system shared libraries without vendoring,
-respect system provider configuration, and verify the resulting linked artifacts.
-Linking and module qualification are build/deployment concerns, separate from the
-Rust key and primitive contracts. The proof of concept tests dynamic linkage and the Rustls provider integration;
-deployment qualification remains work for a production OpenSSL backend.
+The OpenSSL build uses system shared libraries without vendoring, respects system
+provider configuration, and can verify the resulting linked artifacts. Linking
+and module qualification are build/deployment concerns, separate from the Rust
+key and primitive contracts. The standalone
+[OpenSSL contract harness](../../examples/openssl-crypto-poc/README.md) exercises
+the same production backend and its dynamic linkage.
 
 ## Lifecycle and posture
 
@@ -104,7 +108,7 @@ Coverage excludes dependency-owned SSH/russh primitives, AWS SigV4 signing,
 SPIFFE RustCrypto verification, and non-Rust client runtimes. AWS SDK HTTPS also
 retains its dependency-owned selection. Non-security content hashes and ordinary
 scheduling randomness are not migrated. No SSH or PQC capability is asserted by
-the primitive capability report. OpenSSL, strict policy, module version discovery,
+the primitive capability report. Strict policy, validated module version discovery,
 and deployment qualification belong in follow-up work.
 
 Durable proxy CA loading uses backend key import and retains rcgen's X.509

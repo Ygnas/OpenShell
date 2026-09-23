@@ -11,7 +11,7 @@ publish = false
 [workspace]
 
 [dependencies]
-openshell-crypto = { path = "../../crates/openshell-crypto", default-features = false }
+openshell-crypto = { path = "../../crates/openshell-crypto", default-features = false, features = ["openssl"] }
 openssl = { version = "0.10.79", default-features = false }
 rustls-openssl = { version = "=0.4.1", default-features = false, features = ["tls12"] }
 jsonwebtoken-openssl = "=1.0.0"

@@ -3,18 +3,23 @@
 
 //! Backend-neutral crypto operations and library-specific protocol adapters.
 //!
-//! AWS-LC is the only production implementation in this first stage. This crate
-//! does not enable FIPS mode, change algorithms, or attest dependency-owned crypto.
-//! The extension target is a system-OpenSSL backend for regulated deployments
-//! (<https://github.com/NVIDIA/OpenShell/issues/900>). See the crate README for
-//! initialization, key ownership, and dependency coverage boundaries.
+//! AWS-LC is the default implementation. The optional system-OpenSSL backend is
+//! intended for regulated-build experimentation and does not itself attest FIPS
+//! mode or dependency-owned crypto.
 
 pub mod aead;
 #[cfg(feature = "aws-lc")]
 mod aws_lc;
+#[cfg(feature = "openssl")]
+mod openssl;
+#[cfg(feature = "openssl")]
+pub use openssl::OpenSsl;
 pub mod jwt;
 pub mod pki;
 pub mod tls;
+
+#[cfg(all(feature = "aws-lc", feature = "openssl"))]
+compile_error!("features `aws-lc` and `openssl` are mutually exclusive");
 
 use std::sync::{Arc, OnceLock};
 
@@ -152,10 +157,17 @@ impl CryptoContext {
     }
 }
 
-#[cfg(feature = "aws-lc")]
+#[cfg(any(feature = "aws-lc", feature = "openssl"))]
 impl Default for CryptoContext {
     fn default() -> Self {
-        Self::new(Box::new(aws_lc::AwsLc))
+        #[cfg(feature = "aws-lc")]
+        {
+            Self::new(Box::new(aws_lc::AwsLc))
+        }
+        #[cfg(all(feature = "openssl", not(feature = "aws-lc")))]
+        {
+            Self::new(Box::new(OpenSsl))
+        }
     }
 }
 
@@ -172,7 +184,7 @@ pub(crate) fn explicitly_selected() -> bool {
 /// Application default, initialized lazily to AWS-LC unless selected before first use.
 #[must_use]
 pub fn default_context() -> &'static CryptoContext {
-    #[cfg(feature = "aws-lc")]
+    #[cfg(any(feature = "aws-lc", feature = "openssl"))]
     {
         &DEFAULT
             .get_or_init(|| DefaultContext {
@@ -181,7 +193,7 @@ pub fn default_context() -> &'static CryptoContext {
             })
             .context
     }
-    #[cfg(not(feature = "aws-lc"))]
+    #[cfg(not(any(feature = "aws-lc", feature = "openssl")))]
     {
         &DEFAULT
             .get()

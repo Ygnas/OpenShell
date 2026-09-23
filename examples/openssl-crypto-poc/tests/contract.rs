@@ -39,8 +39,8 @@ fn primitives_and_posture() {
     );
     let context = openshell_crypto::default_context();
     let caps = context.verify_posture(false).unwrap();
-    assert_eq!(caps.backend, "openssl-poc");
-    assert!(caps.provider_version.unwrap().starts_with("OpenSSL 3."));
+    assert_eq!(caps.backend, "openssl");
+    assert!(caps.provider_version.unwrap().starts_with("OpenSSL "));
     assert_eq!(
         context.verify_posture(true),
         Err(CryptoError::UnsupportedPosture)

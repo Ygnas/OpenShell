@@ -1,15 +1,30 @@
 # OpenSSL crypto interface proof of concept
 
-This standalone example implements the existing `openshell-crypto` contracts with
-system OpenSSL. It does not select OpenSSL for application binaries. A separate
-Cargo workspace disables the facade's AWS-LC default feature without inheriting
-the application's backend selection.
+This standalone example validates the opt-in `openshell-crypto` OpenSSL backend.
+It does not change the upstream default: normal OpenShell builds continue to use
+AWS-LC. A separate Cargo workspace disables the facade's AWS-LC default feature
+without inheriting the application's backend selection.
 
 Run with Rust, a C compiler, pkg-config and OpenSSL 3 development libraries:
 
 ```shell
 bash examples/openssl-crypto-poc/validate.sh
 ```
+
+The same validation runs in `.github/workflows/fips-openssl.yml` on pull requests
+and with `workflow_dispatch`. It uses only the checked-out source and public
+dependencies, so it works on the upstream repository and on forks. The workflow
+checks OpenSSL linkage, provider inventory, backend contract behavior, and
+dependency closure; it does not prove a FIPS-validated module or runtime FIPS
+mode. Publishing, image signature verification, and RHEL/RHCOS runtime
+qualification require a separate trusted environment.
+
+Final-image scanning is separate in `.github/workflows/fips-check-payload.yml`.
+That workflow builds standalone UBI 9/UBI-minimal gateway and supervisor
+candidate images, then scans those exact local images with the pinned
+`check-payload` binary and `--fail-on-warnings`. It does not use Konflux or
+publish images. A passing scan is final-artifact evidence for that image build,
+not a CMVP or runtime FIPS certification.
 
 The script sets `OPENSSL_NO_VENDOR=1` and `OPENSSL_STATIC=0`, runs formatting,
 Clippy and contract tests, rejects AWS-LC, Ring and vendored OpenSSL dependencies,

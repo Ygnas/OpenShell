@@ -27,8 +27,9 @@ Sandbox community images are built outside this repository.
 
 ## Build Features
 
-Rust builds require Rust 1.94 or newer. TLS and certificate generation use
-AWS-LC, including the CLI and standalone examples. Native and cross-build
+Rust builds require Rust 1.94 or newer. Upstream TLS and certificate generation
+use AWS-LC, while the opt-in OpenSSL contract harness exercises the alternative
+system-provider path. Native and cross-build
 environments must provide the C toolchain required by aws-lc-sys; the Nix
 development shells provide static AWS-LC libraries.
 
@@ -36,15 +37,21 @@ First-party crypto selection lives in `openshell-crypto`: backend-neutral
 primitive traits and protocol adapters preserve existing TLS, PKI, JWT, and
 credential-storage behavior. Application crates enable integration features on
 that crate instead of naming a backend. The workspace selects the default AWS-LC
-feature centrally. Backend-owned signing keys support fallible export and import;
+feature centrally; the isolated OpenSSL path uses `--no-default-features
+--features openssl`. Backend-owned signing keys support fallible export and import;
 rcgen only adapts certificate encoding. Explicit context selection controls
 first-party TLS configuration even after Rustls global initialization. Without
 explicit selection, builders preserve embedder defaults. Capability reporting
 does not attest globals or dependency-owned crypto. The standalone
 [OpenSSL interface experiment](../examples/openssl-crypto-poc/README.md) exercises
 this boundary against dynamically linked system OpenSSL without selecting it for
-application binaries. Dynamic-link packaging and strict FIPS operation remain
-follow-up work. The crate README defines extension and coverage boundaries.
+application binaries. The fork-safe `fips-openssl` workflow validates this path
+without claiming a validated FIPS module or runtime FIPS mode. Product-wide
+feature propagation, dynamic-link packaging, and strict FIPS operation remain
+follow-up work. The separate `fips-check-payload` workflow builds standalone UBI
+candidate images and scans the exact local artifacts with `check-payload`; it
+does not use Konflux or publish images. The crate README defines extension and
+coverage boundaries.
 The rcgen certificate-parser feature is enabled only by the MITM proxy that
 imports persisted CAs; it is not required by the crypto facade.
 Digest operations propagate backend failures through JWT and credential key-ID
