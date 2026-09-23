@@ -28,8 +28,19 @@ jobs:
       - name: Install Podman and build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends podman jq
+          sudo apt-get install --yes --no-install-recommends podman jq binutils
           podman version
+
+      - name: Install OpenShift client required by check-payload
+        env:
+          OPENSHIFT_CLIENT_VERSION: 4.19.0
+        run: |
+          curl --fail --location --retry 3 \
+            "https://mirror.openshift.com/pub/openshift-v4/clients/ocp/${OPENSHIFT_CLIENT_VERSION}/openshift-client-linux.tar.gz" \
+            --output "${RUNNER_TEMP}/openshift-client.tar.gz"
+          tar -xzf "${RUNNER_TEMP}/openshift-client.tar.gz" -C "${RUNNER_TEMP}" oc
+          sudo install -m 0755 "${RUNNER_TEMP}/oc" /usr/local/bin/oc
+          oc version --client
 
       - name: Build gateway FIPS candidate image
         run: |
