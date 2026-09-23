@@ -54,6 +54,19 @@ jobs:
             --file deploy/docker/Dockerfile.fips.supervisor \
             --tag localhost/openshell-supervisor:fips-${GITHUB_SHA} .
 
+      - name: Publish candidates to ephemeral local registry
+        run: |
+          podman run --detach --name fips-check-payload-registry \
+            --publish 127.0.0.1:5000:5000 registry:2
+          curl --fail --retry 10 --retry-delay 1 --retry-connrefused \
+            http://127.0.0.1:5000/v2/
+          for image in gateway supervisor; do
+            podman tag "localhost/openshell-${image}:fips-${GITHUB_SHA}" \
+              "127.0.0.1:5000/openshell-${image}:fips-${GITHUB_SHA}"
+            podman push --tls-verify=false \
+              "127.0.0.1:5000/openshell-${image}:fips-${GITHUB_SHA}"
+          done
+
       - name: Build pinned check-payload scanner
         env:
           CHECK_PAYLOAD_REF: a0d24f93afba5041e7761328568eb7f23aff7626
@@ -70,14 +83,16 @@ jobs:
       - name: Scan gateway image with check-payload
         run: |
           "${RUNNER_TEMP}/check-payload" scan operator \
-            --spec "localhost/openshell-gateway:fips-${GITHUB_SHA}" \
+            --spec "127.0.0.1:5000/openshell-gateway:fips-${GITHUB_SHA}" \
+            --insecure-pull \
             --fail-on-warnings \
             --output-file "${RUNNER_TEMP}/gateway-check-payload.txt"
 
       - name: Scan supervisor image with check-payload
         run: |
           "${RUNNER_TEMP}/check-payload" scan operator \
-            --spec "localhost/openshell-supervisor:fips-${GITHUB_SHA}" \
+            --spec "127.0.0.1:5000/openshell-supervisor:fips-${GITHUB_SHA}" \
+            --insecure-pull \
             --fail-on-warnings \
             --output-file "${RUNNER_TEMP}/supervisor-check-payload.txt"
 
