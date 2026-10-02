@@ -74,7 +74,7 @@ RUN mkdir -p /tmp/z3-src \
     cargo auditable build --release \
         --package openshell-gateway \
         --no-default-features \
-        --features defaults-without-telemetry,bundled-z3 && \
+        --features defaults-without-telemetry,vendored-z3 && \
     if ! readelf -S /build/target/release/openshell-gateway | grep -q '\.dep-v0'; then \
         echo "openshell-gateway is missing cargo-auditable .dep-v0 metadata" >&2; exit 1; \
     fi
