@@ -97,7 +97,7 @@ RUN . /tmp/build-env && \
 # ---------------------------------------------------------------------------
 FROM registry.access.redhat.com/ubi9/ubi-minimal:9.8@sha256:7fbeae18dc9476399f565e68255f602a3374ea8614ba3d14843565131a13ff93
 
-RUN microdnf install -y --nodocs ca-certificates crypto-policies-scripts \
+RUN microdnf install -y --nodocs ca-certificates crypto-policies-scripts git-core \
     && microdnf clean all
 
 # Enable post-quantum cryptography support in the RHEL system policy.
@@ -116,5 +116,8 @@ LABEL com.redhat.component="odh-openshell-cli-container" \
       com.redhat.license_terms="https://www.redhat.com/licenses/Red_Hat_Standard_EULA_20191108.pdf"
 
 USER 1000:1000
+
+# Uploads need Git for repository discovery, even outside a Git work tree.
+RUN git --version
 
 ENTRYPOINT ["/usr/local/bin/openshell"]
