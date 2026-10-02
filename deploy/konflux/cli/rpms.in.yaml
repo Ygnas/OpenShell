@@ -39,6 +39,7 @@ packages:
   - gcc-c++
   - cmake
   - openssl-devel
+  # Build and runtime: Git is required for CLI upload filtering.
   - git-core
   # Runtime stage
   - ca-certificates
