@@ -1268,6 +1268,21 @@ pub trait ComputeDriverFactory: Send + Sync {
         false
     }
 
+    /// Check locally installed host tools after configuration validation.
+    ///
+    /// Only the explicit `config preflight` command calls this hook. Probes
+    /// must bound time and output, clean up on cancellation, and avoid driver
+    /// startup, transport connections, images, and runtime state. Return
+    /// operator-readable results including the selected executable paths.
+    /// The process inherits the gateway's account and environment. When
+    /// `cancellation` becomes true, finish process cleanup before returning.
+    async fn preflight_host_tools(
+        &self,
+        _cancellation: watch::Receiver<bool>,
+    ) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+
     async fn build(&self, context: ComputeDriverBuildContext<'_>) -> Result<ComputeDriverInstance>;
 }
 
@@ -1711,6 +1726,9 @@ async fn build_compute_runtime(
 
     let runtime = runtime
         .with_admission_policy(admission)
+        .and_then(|runtime| {
+            runtime.with_image_preparation_timeout(config.image_preparation_timeout_seconds)
+        })
         .map_err(Error::config)?;
     Ok(runtime.with_telemetry_compute_driver(telemetry_compute_driver))
 }
