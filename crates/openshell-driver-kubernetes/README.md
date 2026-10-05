@@ -17,8 +17,12 @@ workspace namespace modes via `workspace_mode`:
 - **Shared** (default): All sandboxes render into a single static namespace.
   Resource names use `{workspace}--{name}` for collision avoidance.
 - **Managed**: The driver auto-creates/deletes a K8s namespace per workspace
-  (`openshell-{gateway_id}-{workspace_name}`), creates a ServiceAccount in each,
-  and copies OpenShift SCC annotations from the gateway namespace when present.
+  (`openshell-{gateway_id}-{workspace_name}`) and creates a ServiceAccount in
+  each. On OpenShift, it leaves SCC annotations to the namespace allocator and
+  waits for the namespace's own MCS, UID-range, and supplemental-group
+  annotations before provisioning sandbox resources. An existing namespace with
+  a UID range but no MCS must be recreated so OpenShift can allocate a complete
+  set of SCC annotations.
 - **Operator**: Workspace names map 1:1 to pre-provisioned namespaces discovered
   through exactly one source: either a label selector
   (`operator_namespace_label`) or a drop-in allowlist file
@@ -157,7 +161,10 @@ UID. Restart requires exactly one matching Sandbox resource and preserves its
 namespace and UID while rotating the supervisor Pod UID. The gateway requires
 the authenticated identity to match the durable binding before returning the
 generation-bound session JWT used by the supervisor. The sandbox Pod receives
-neither token.
+neither token. For HTTPS gateway connections, the supervisor reads only the
+CA from the configured TLS Secret. Shared mode projects `ca.crt` directly;
+managed and operator modes stage only the CA into the supervisor bootstrap
+Secret. User client certificates and private keys are not mounted into either Pod.
 
 The gateway uses the supervisor relay for connect, exec, logs, and file sync.
 Sandbox Pods do not need direct external ingress for SSH.
@@ -178,6 +185,13 @@ credentials after launch and must inspect its same-identity descendants.
 The workload Pod does not share host network, PID, IPC, or process namespaces.
 The driver uses a scheduling gate to inspect the admitted Pod and bind its UID
 into the bootstrap claims before kubelet starts it.
+
+Lifecycle RPCs and runtime reconciliation share a per-sandbox mutation gate
+across clones of the driver. Reconciliation skips busy sandboxes and refreshes
+the Sandbox CR under that gate before cleanup, so a stopped or stopping LIST
+snapshot cannot delete a supervisor created by a concurrent restart in the same
+driver instance. The gate preserves concurrency across sandboxes; it does not
+provide distributed exclusion between separate gateway or driver processes.
 
 ## GPU Support
 

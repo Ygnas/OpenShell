@@ -312,6 +312,9 @@ pub(crate) const DEFAULT_SANDBOX_UID: u32 = 10001;
 /// Format: `<start>/<size>` (e.g. `1000000000/10000`).
 pub const ANNOTATION_SCC_UID_RANGE: &str = "openshift.io/sa.scc.uid-range";
 
+/// The annotation key for the `OpenShift` MCS label allocated to a namespace.
+pub const ANNOTATION_SCC_MCS: &str = "openshift.io/sa.scc.mcs";
+
 /// The annotation key for the `OpenShift` `ServiceAccount` supplemental groups.
 /// Format: `<start>/<size>` (e.g. `1000000000/10000`).
 pub const ANNOTATION_SCC_SUPPLEMENTAL_GROUPS: &str = "openshift.io/sa.scc.supplemental-groups";
@@ -624,7 +627,7 @@ impl KubernetesComputeConfig {
         !matches!(self.workspace_mode, WorkspaceMode::Shared)
     }
 
-    /// Where supervisor Pods read the gateway client TLS material. Outside
+    /// Where supervisor Pods read the gateway CA. Outside
     /// shared mode it is staged into each generation's bootstrap Secret.
     #[must_use]
     pub fn supervisor_client_tls(&self) -> crate::sandbox_runtime::SupervisorClientTls<'_> {

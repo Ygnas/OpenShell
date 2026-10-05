@@ -65,6 +65,7 @@ use openshell_sandbox_backend::boundary_protocol::{
 };
 use opentelemetry::trace::TraceContextExt as _;
 use sha2::{Digest as _, Sha256};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -189,13 +190,15 @@ pub struct DockerComputeConfig {
     /// Image containing the trusted `openshell-supervisor` binary.
     pub supervisor_image: Option<String>,
 
-    /// Host-side CA certificate for Docker sandbox mTLS.
+    /// Host-side CA certificate for sandbox-to-gateway TLS.
     pub guest_tls_ca: Option<PathBuf>,
 
-    /// Host-side client certificate for Docker sandbox mTLS.
+    /// Deprecated. Sandboxes authenticate with bearer tokens and must not
+    /// receive a user client certificate.
     pub guest_tls_cert: Option<PathBuf>,
 
-    /// Host-side private key for Docker sandbox mTLS.
+    /// Deprecated. Sandboxes authenticate with bearer tokens and must not
+    /// receive a user client private key.
     pub guest_tls_key: Option<PathBuf>,
 
     /// Unix socket path used for interactive sandbox access.
@@ -293,8 +296,6 @@ impl Default for DockerComputeConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DockerGuestTlsPaths {
     pub(crate) ca: PathBuf,
-    pub(crate) cert: PathBuf,
-    pub(crate) key: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -2968,7 +2969,7 @@ impl DockerComputeDriver {
         );
         let mut stream = self.docker.create_image(
             Some(CreateImageOptions {
-                from_image: Some(image.to_string()),
+                from_image: Some(normalize_pull_reference(image).into_owned()),
                 ..Default::default()
             }),
             None,
@@ -4676,11 +4677,7 @@ async fn docker_supervisor_bundle_archive(
             SUPERVISOR_UID,
             SUPERVISOR_GID,
         )?;
-        for (name, path) in [
-            ("ca.pem", &tls.ca),
-            ("cert.pem", &tls.cert),
-            ("key.pem", &tls.key),
-        ] {
+        for (name, path) in [("ca.pem", &tls.ca)] {
             let contents = tokio::fs::read(path).await.map_err(|error| {
                 Status::internal(format!(
                     "read Docker supervisor TLS file {}: {error}",
@@ -5097,20 +5094,10 @@ async fn spawn_docker_control_process(
         ),
     ];
     if config.guest_tls.is_some() {
-        environment.extend([
-            format!(
-                "{}={SUPERVISOR_STATE_MOUNT_PATH}/tls/ca.pem",
-                openshell_core::sandbox_env::TLS_CA
-            ),
-            format!(
-                "{}={SUPERVISOR_STATE_MOUNT_PATH}/tls/cert.pem",
-                openshell_core::sandbox_env::TLS_CERT
-            ),
-            format!(
-                "{}={SUPERVISOR_STATE_MOUNT_PATH}/tls/key.pem",
-                openshell_core::sandbox_env::TLS_KEY
-            ),
-        ]);
+        environment.push(format!(
+            "{}={SUPERVISOR_STATE_MOUNT_PATH}/tls/ca.pem",
+            openshell_core::sandbox_env::TLS_CA
+        ));
     }
     if let Some(socket) = config.provider_spiffe_workload_api_socket.as_ref() {
         let projected = openshell_core::driver_utils::projected_provider_spiffe_socket_path(socket)
@@ -5302,12 +5289,6 @@ async fn spawn_docker_control_process(
                 if !log_tail.is_empty() {
                     write!(message, "; log tail: {log_tail}").ok();
                 }
-                let sandbox_log_tail =
-                    docker_container_log_tail(&monitored_docker, &failure_context.container_id)
-                        .await;
-                if !sandbox_log_tail.is_empty() {
-                    write!(message, "; sandbox log tail: {sandbox_log_tail}").ok();
-                }
                 let _ = monitored_docker.remove_container(
                     &monitored_supervisor_id,
                     Some(RemoveContainerOptionsBuilder::default().force(true).build()),
@@ -5358,11 +5339,9 @@ async fn wait_for_docker_supervisor_ready(
                 Status::internal(format!("inspect Docker sandbox container: {error}"))
             })?;
         if sandbox.state.unwrap_or_default().running == Some(false) {
-            let sandbox_log_tail = docker_container_log_tail(docker, sandbox_id).await;
-            return Err(Status::unavailable(format!(
-                "Docker sandbox exited before supervisor became ready{}",
-                format_named_log_tail("sandbox log tail", &sandbox_log_tail)
-            )));
+            return Err(Status::unavailable(
+                "Docker sandbox exited before supervisor became ready",
+            ));
         }
         let inspected = docker
             .inspect_container(supervisor_id, None)
@@ -5375,11 +5354,10 @@ async fn wait_for_docker_supervisor_ready(
             Some(HealthStatusEnum::HEALTHY) => return Ok(()),
             _ if state.running == Some(false) => {
                 let log_tail = docker_container_log_tail(docker, supervisor_id).await;
-                let sandbox_log_tail = docker_container_log_tail(docker, sandbox_id).await;
+                warn!(sandbox_id, supervisor_id, supervisor_logs = %log_tail, "Docker supervisor exited before becoming ready");
                 return Err(Status::unavailable(format!(
-                    "Docker supervisor exited before becoming ready{}{}",
-                    format_log_tail(&log_tail),
-                    format_named_log_tail("sandbox log tail", &sandbox_log_tail)
+                    "Docker supervisor exited before becoming ready{}",
+                    format_log_tail(&log_tail)
                 )));
             }
             _ => tokio::time::sleep(Duration::from_millis(100)).await,
@@ -5388,14 +5366,20 @@ async fn wait_for_docker_supervisor_ready(
 }
 
 fn format_log_tail(log_tail: &str) -> String {
-    format_named_log_tail("log tail", log_tail)
-}
-
-fn format_named_log_tail(label: &str, log_tail: &str) -> String {
+    // gRPC status messages travel in HTTP/2 headers. A full 16 KiB container
+    // tail can exceed the client's 16 KiB header budget and hide the real
+    // error behind PROTOCOL_ERROR. Allow for up to 3x percent-encoding expansion.
+    const MAX_STATUS_LOG_TAIL_BYTES: usize = 1024;
     if log_tail.is_empty() {
         String::new()
+    } else if log_tail.len() > MAX_STATUS_LOG_TAIL_BYTES {
+        let mut start = log_tail.len() - MAX_STATUS_LOG_TAIL_BYTES;
+        while !log_tail.is_char_boundary(start) {
+            start += 1;
+        }
+        format!("; log tail: [truncated] {}", &log_tail[start..])
     } else {
-        format!("; {label}: {log_tail}")
+        format!("; log tail: {log_tail}")
     }
 }
 
@@ -6315,6 +6299,43 @@ fn container_name_for_sandbox(sandbox: &DriverSandbox) -> String {
     format!("{CONTAINER_NAME_PREFIX}{workspace}--{truncated_name}-{id_suffix}")
 }
 
+/// Normalize an image reference for a pull request by appending `:latest`
+/// when it carries neither an explicit tag nor a digest.
+///
+/// The Docker daemon's `create_image` endpoint interprets a `fromImage` with
+/// no tag as "every tag in the repository" and pulls them all, so a bare
+/// `--from` reference such as `nicolaka/netshoot` must be resolved to a single
+/// tag the way `docker pull` (and the Podman driver) do.
+///
+/// Parsing mirrors [`openshell_core::driver_utils::supervisor_image_tag`]: only
+/// the final path component may carry a tag, so a registry port such as the
+/// `:5000` in `registry:5000/team/app` is not mistaken for one, and a
+/// digest-pinned reference (`...@sha256:...`) already names an exact image and
+/// is left untouched. A separate helper is needed because `supervisor_image_tag`
+/// resolves a bare reference to an implied `latest` and so cannot distinguish a
+/// reference that still needs a tag appended.
+///
+/// Examples:
+/// - `"nicolaka/netshoot"` → `"nicolaka/netshoot:latest"`
+/// - `"foo:1.2"` → `"foo:1.2"` (already tagged)
+/// - `"foo@sha256:abc"` → `"foo@sha256:abc"` (digest-pinned)
+/// - `"registry:5000/team/app"` → `"registry:5000/team/app:latest"`
+/// - `"registry:5000/team/app:v1"` → `"registry:5000/team/app:v1"`
+fn normalize_pull_reference(image: &str) -> Cow<'_, str> {
+    // A digest-pinned reference already identifies an exact image.
+    if image.contains('@') {
+        return Cow::Borrowed(image);
+    }
+    // A `:` only denotes a tag in the final path component; earlier ones are
+    // registry ports (e.g. `registry:5000/team/app`).
+    let last_component = image.rsplit('/').next().unwrap_or(image);
+    if last_component.contains(':') {
+        Cow::Borrowed(image)
+    } else {
+        Cow::Owned(format!("{image}:latest"))
+    }
+}
+
 /// Docker container names may not end with `-`, `.`, or `_`. Truncation can
 /// leave one of those trailing, so strip them before returning.
 fn trim_container_name_tail(mut value: String) -> String {
@@ -6346,7 +6367,7 @@ fn sanitize_docker_name(value: &str) -> String {
 async fn pull_runtime_image(docker: &Docker, image: &str, role: &str) -> CoreResult<()> {
     let mut stream = docker.create_image(
         Some(CreateImageOptions {
-            from_image: Some(image.to_string()),
+            from_image: Some(normalize_pull_reference(image).into_owned()),
             ..Default::default()
         }),
         None,
@@ -6505,8 +6526,6 @@ fn canonicalize_existing_file(path: &Path, description: &str) -> CoreResult<Path
 
 fn docker_guest_tls_configured(docker_config: &DockerComputeConfig) -> bool {
     docker_config.guest_tls_ca.is_some()
-        && docker_config.guest_tls_cert.is_some()
-        && docker_config.guest_tls_key.is_some()
 }
 
 fn default_docker_supervisor_grpc_endpoint(gateway_port: u16, tls: bool) -> String {
@@ -6521,24 +6540,25 @@ pub(crate) fn docker_guest_tls_paths(
         || docker_config.guest_tls_cert.is_some()
         || docker_config.guest_tls_key.is_some();
 
+    if docker_config.guest_tls_cert.is_some() || docker_config.guest_tls_key.is_some() {
+        return Err(Error::config(
+            "guest_tls_cert and guest_tls_key are no longer supported; sandboxes authenticate to the gateway with bearer tokens",
+        ));
+    }
+
     if !docker_config.grpc_endpoint.starts_with("https://") {
         if tls_flags_provided {
             return Err(Error::config(format!(
-                "guest_tls_ca/guest_tls_cert/guest_tls_key were provided but grpc_endpoint is '{}'; TLS materials require an https:// endpoint",
+                "guest_tls_ca was provided but grpc_endpoint is '{}'; TLS materials require an https:// endpoint",
                 docker_config.grpc_endpoint,
             )));
         }
         return Ok(None);
     }
 
-    let provided = [
-        docker_config.guest_tls_ca.as_ref(),
-        docker_config.guest_tls_cert.as_ref(),
-        docker_config.guest_tls_key.as_ref(),
-    ];
-    if provided.iter().all(Option::is_none) {
+    if docker_config.guest_tls_ca.is_none() {
         return Err(Error::config(
-            "docker compute driver requires guest_tls_ca, guest_tls_cert, and guest_tls_key when grpc_endpoint uses https://",
+            "docker compute driver requires guest_tls_ca when grpc_endpoint uses https://",
         ));
     }
 
@@ -6547,21 +6567,8 @@ pub(crate) fn docker_guest_tls_paths(
             "guest_tls_ca is required when Docker sandbox TLS materials are configured",
         ));
     };
-    let Some(cert) = docker_config.guest_tls_cert.clone() else {
-        return Err(Error::config(
-            "guest_tls_cert is required when Docker sandbox TLS materials are configured",
-        ));
-    };
-    let Some(key) = docker_config.guest_tls_key.clone() else {
-        return Err(Error::config(
-            "guest_tls_key is required when Docker sandbox TLS materials are configured",
-        ));
-    };
-
     Ok(Some(DockerGuestTlsPaths {
         ca: canonicalize_existing_file(&ca, "docker TLS CA certificate")?,
-        cert: canonicalize_existing_file(&cert, "docker TLS client certificate")?,
-        key: canonicalize_existing_file(&key, "docker TLS client private key")?,
     }))
 }
 

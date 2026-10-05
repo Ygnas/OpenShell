@@ -19,6 +19,12 @@ the release cycle. Use a stable release for production deployments.
 | Pre-release | Built nightly when `main` has changed and normal CI passes. Versions use the form `X.Y.Z-pre.N`. | Validating the immutable artifact set proposed for the next stable release. Pre-releases use the stable feature set but may not have passed qualification. |
 | Stable | Promoted from a pre-release that passes conformance, upgrade, API compatibility, artifact, and security checks. Versions use the form `X.Y.Z`. | Production use within this support matrix. |
 
+The tagged release pipeline publishes pre-release and stable artifacts only
+after its current qualification profile passes. Failed candidates retain build
+artifacts and qualification evidence in CI storage. The current profile covers
+part of the complete release qualification policy; passing it does not establish
+full RFC 0014 coverage.
+
 Tagged stable releases generally go out every week. OpenShell targets Tuesday
 publication when there are changes and every blocking qualification check
 passes. A security release may ship sooner.
@@ -105,6 +111,11 @@ OpenShell publishes standalone `openshell-prover` release assets for manual down
 | macOS Apple Silicon   | `openshell-prover-aarch64-apple-darwin.tar.gz`        |
 
 These artifacts are attached to GitHub releases. The Linux binaries are static and do not require glibc. All prover archives include the required solver linkage.
+
+The Debian, RPM, Homebrew, and Snap packages also include the prover. Debian,
+RPM, and Homebrew installations expose it as `openshell-prover`; use
+`openshell.prover` with the Snap. The `openshell-prover` Snap alias requires
+Store approval and may not be available.
 
 ## Runtimes
 

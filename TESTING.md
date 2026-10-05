@@ -52,8 +52,7 @@ Rust validation checks tracked Cargo lockfiles; run `mise run rust:lockfiles:che
 
 Use `mise run --skip-tools pre-commit` with the existing Rust/MSVC toolchain.
 Windows now checks tracked Cargo lockfiles through PowerShell rather than
-skipping them. The deterministic gateway parity task uses Git for Windows Bash,
-with temporary Python launchers confined to a unique checkout-owned directory.
+skipping them.
 
 `mise run --skip-tools sdk:ts:ci` selects the x64 Biome executable on Windows
 (including ARM64 hosts running it under emulation), resolves the protobuf
@@ -103,6 +102,10 @@ OPENSHELL_GATEWAY_ENDPOINT=http://127.0.0.1:18080 mise run e2e
 
 Raw endpoint mode is HTTP-only. Use a named gateway config when a gateway
 requires mTLS.
+
+`mise run test:gateway-config` validates generated gateway TOML without a live
+runtime. It covers the current schema and the Podman in-tree versus external
+driver configuration boundary.
 
 ### Python E2E (`e2e/python/`)
 
@@ -177,6 +180,35 @@ def test_multiply(sandbox):
 Rust-based e2e tests that exercise the `openshell` CLI binary as a subprocess.
 They live in the `openshell-e2e` crate and use a shared harness for sandbox
 lifecycle management, output parsing, and cleanup.
+
+Exposed service URLs use virtual hostnames for gateway routing. Host-side tests
+must connect the TCP socket directly to a reachable gateway listener address,
+normally loopback, and send the service URL authority in the HTTP `Host`
+header. Do not resolve `*.openshell.localhost`; resolver support for arbitrary
+`.localhost` subdomains varies across local and CI environments.
+
+Treat the advertised service URL scheme as authoritative. For HTTPS, use the
+virtual service hostname for TLS SNI and the configured gateway trust roots.
+When the listener requires mTLS, present the active gateway client identity;
+the local e2e wrappers register these materials under
+`$XDG_CONFIG_HOME/openshell/gateways/$OPENSHELL_GATEWAY/mtls/`. Do not downgrade
+an HTTPS service URL to plaintext when dialing loopback. Parse the URL and load
+TLS material before entering a readiness loop so permanent configuration
+errors fail immediately. Retry only transient connection failures and
+documented readiness responses, and include the last observation in timeout
+diagnostics.
+
+Verify exposed-service tests in both the default local mode and the
+CI-equivalent HTTPS mode:
+
+```shell
+mise run e2e:rust
+OPENSHELL_ENABLE_LOOPBACK_SERVICE_HTTP=false mise run e2e:rust
+```
+
+When more than one test needs this behavior, put the transport in the shared
+Rust e2e harness and require callers to use it instead of duplicating DNS,
+HTTP `Host`, TLS SNI, and mTLS handling.
 
 Suites:
 
@@ -258,9 +290,26 @@ Run the portable subset in a disposable rootless Podman guest:
 
 ```shell
 nix run .#build-artifacts
-nix run .#tmachine -- test fedora-podman-rootless binaries e2e-podman
-nix run .#tmachine -- test fedora-podman-rootless binaries driver-podman
+nix run .#tmachine -- test fedora-podman-rootless rpm e2e-podman
+nix run .#tmachine -- test fedora-podman-rootless rpm driver-podman
 ```
+
+The driver suites also support the `binaries` installer. The shared installer
+roles save the active gateway configuration, registration name, service scope,
+service owner, and network name in `/var/lib/openshell-test/gateway.yaml`.
+Suites resolve `openshell` from PATH and use that registration, including the
+packaged gateway's HTTPS client credentials. Namespace fixtures modify the
+active qualification configuration and restart its system or user service.
+Failure diagnostics select the matching journal unit and user ID. Missing
+metadata or credentials fail the run; suites do not replace package setup with
+an HTTP gateway. Ansible sources participate in tmachine's installation cache
+hash, so older cached installations are rebuilt with this metadata.
+
+The `driver-podman` suite supports rootful and rootless Podman. The
+`e2e-podman` archive requires rootless Podman for its host workload fixtures.
+DEB and RPM installers share the gateway role; available environments pair
+DEB with Ubuntu/Docker and RPM with Fedora/Podman. A DEB/Podman run requires an
+Ubuntu Podman environment.
 
 Print the exact tmachine archive selection as a shell `PODMAN_CI_TESTS` array:
 

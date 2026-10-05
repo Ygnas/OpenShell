@@ -24,6 +24,31 @@ use std::io::Read as _;
 use std::sync::Arc;
 use tempfile::TempDir;
 
+#[test]
+fn startup_error_log_tails_fit_grpc_header_budget() {
+    // Multibyte text exercises both the UTF-8 cut and worst-case gRPC message
+    // percent encoding. Preserve the supervisor's final diagnostic.
+    let logs = format!("{}\nstartup timed out", "🦀".repeat(8192));
+    let message = format!(
+        "Docker supervisor exited before becoming ready{}",
+        format_log_tail(&logs),
+    );
+    assert_eq!(message.matches("[truncated]").count(), 1);
+    assert_eq!(message.matches("startup timed out").count(), 1);
+    let response = Status::unavailable(message).into_http::<()>();
+    let header_bytes: usize = response
+        .headers()
+        .iter()
+        .map(|(name, value)| name.as_str().len() + value.as_bytes().len() + 32)
+        .sum();
+    assert!(
+        header_bytes < 16 * 1024,
+        "status headers: {header_bytes} bytes"
+    );
+    assert_eq!(format_log_tail("small error"), "; log tail: small error");
+    assert!(format_log_tail("").is_empty());
+}
+
 fn test_launch_authentication() -> Vec<u8> {
     serde_json::to_vec(&SandboxLaunchAuthentication {
         supervisor: SupervisorAuthBundle {
@@ -188,8 +213,6 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
         ssh_socket_path: openshell_core::container_paths::SSH_SOCKET_PATH.to_string(),
         guest_tls: Some(DockerGuestTlsPaths {
             ca: PathBuf::from("/tmp/ca.crt"),
-            cert: PathBuf::from("/tmp/tls.crt"),
-            key: PathBuf::from("/tmp/tls.key"),
         }),
         gpu: DockerGpuRuntimeCapabilities {
             cdi_supported: false,
@@ -2481,6 +2504,23 @@ fn validate_sandbox_rejects_unknown_driver_config_fields() {
 }
 
 #[test]
+fn sandbox_driver_config_rejects_trusted_runtime_image_overrides() {
+    for field in ["sandbox_runtime_image", "supervisor_image"] {
+        let template = DriverSandboxTemplate {
+            driver_config: Some(json_struct(serde_json::json!({
+                (field): "registry.example.com/openshell/runtime:untrusted"
+            }))),
+            ..Default::default()
+        };
+
+        let error = DockerSandboxDriverConfig::from_template(&template)
+            .expect_err("sandbox requests must not select trusted runtime images");
+        assert!(error.contains("unknown field"), "{error}");
+        assert!(error.contains(field), "{error}");
+    }
+}
+
+#[test]
 fn validate_sandbox_accepts_gpu_count_request_shape() {
     let mut config = runtime_config();
     config.gpu.cdi_supported = true;
@@ -3237,18 +3277,19 @@ fn workload_mounts_only_the_shared_channel_volume() {
 }
 
 #[test]
-fn docker_guest_tls_paths_require_all_files_for_https() {
+fn docker_guest_tls_paths_accept_ca_only_for_https() {
     let tempdir = TempDir::new().unwrap();
     let ca = tempdir.path().join("ca.crt");
     fs::write(&ca, b"ca").unwrap();
 
-    let err = docker_guest_tls_paths(&DockerComputeConfig {
+    let paths = docker_guest_tls_paths(&DockerComputeConfig {
         grpc_endpoint: "https://localhost:8443".to_string(),
-        guest_tls_ca: Some(ca),
+        guest_tls_ca: Some(ca.clone()),
         ..Default::default()
     })
-    .unwrap_err();
-    assert!(err.to_string().contains("guest_tls_cert"));
+    .unwrap()
+    .expect("CA-only TLS paths");
+    assert_eq!(paths.ca, ca.canonicalize().unwrap());
 }
 
 #[test]
@@ -3663,4 +3704,33 @@ fn admission_provisioning_failure_distinguishes_denials_from_lookup_failures() {
     ));
     assert_eq!(lookup.reason, "ResourceAdmissionLookupFailed");
     assert_eq!(lookup.message, "inspect docker volume failed");
+}
+
+#[test]
+fn normalize_pull_reference_appends_latest_only_when_untagged() {
+    // A bare repository reference must resolve to a single tag so the daemon
+    // does not pull every tag in the repository (issue #4029).
+    assert_eq!(
+        normalize_pull_reference("nicolaka/netshoot"),
+        "nicolaka/netshoot:latest"
+    );
+    // An explicit tag is preserved untouched.
+    assert_eq!(normalize_pull_reference("foo:1.2"), "foo:1.2");
+    // A digest-pinned reference already names an exact image.
+    assert_eq!(
+        normalize_pull_reference(
+            "foo@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+        ),
+        "foo@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    );
+    // A registry port is not a tag, so `:latest` is still appended.
+    assert_eq!(
+        normalize_pull_reference("registry:5000/team/app"),
+        "registry:5000/team/app:latest"
+    );
+    // A registry port combined with an explicit tag is left unchanged.
+    assert_eq!(
+        normalize_pull_reference("registry:5000/team/app:v1"),
+        "registry:5000/team/app:v1"
+    );
 }

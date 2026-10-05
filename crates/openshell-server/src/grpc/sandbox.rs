@@ -605,7 +605,12 @@ async fn handle_create_sandbox_inner(
         .status
         .as_mut()
         .expect("status initialized")
-        .provisioning = Some(crate::compute::provisioning_deadline::new_record(now_ms));
+        .provisioning = Some(
+        crate::compute::provisioning_deadline::new_preparation_record(
+            now_ms,
+            state.config.image_preparation_timeout_seconds,
+        ),
+    );
     crate::compute::provisioning_deadline::refresh_configuration(
         &state.store,
         &mut sandbox,
@@ -629,6 +634,9 @@ async fn handle_create_sandbox_inner(
     )
     .await?;
 
+    state
+        .compute
+        .validate_launch_signer_configured(state.sandbox_session_jwt_authority.is_some())?;
     state
         .compute
         .validate_sandbox_create(&sandbox)
@@ -680,6 +688,11 @@ async fn handle_create_sandbox_inner(
             &sandbox,
             &exposure.service,
             exposure.target_port,
+            super::service::validate_service_exposure_request(
+                &exposure.service,
+                exposure.target_port,
+                exposure.authorization_mode,
+            )?,
         )
         .await
         {
@@ -741,7 +754,11 @@ fn validate_create_sandbox_request_pre_io(
     }
     let mut service_names = HashSet::with_capacity(request.service_exposures.len());
     for exposure in &request.service_exposures {
-        super::service::validate_service_exposure_request(&exposure.service, exposure.target_port)?;
+        super::service::validate_service_exposure_request(
+            &exposure.service,
+            exposure.target_port,
+            exposure.authorization_mode,
+        )?;
         if !service_names.insert(exposure.service.as_str()) {
             return Err(Status::invalid_argument(format!(
                 "duplicate service exposure name: '{}'",
@@ -3736,7 +3753,7 @@ impl russh::client::Handler for SandboxSshClientHandler {
 
     async fn check_server_key(
         &mut self,
-        _server_public_key: &russh::keys::PublicKey,
+        _server_public_key: &russh::keys::PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
         Ok(true)
     }
@@ -3924,7 +3941,117 @@ mod tests {
         test_server_state_with_driver,
     };
     use openshell_core::proto::datamodel::v1::ObjectMeta;
-    use openshell_core::proto::{GpuResourceRequirements, SandboxServiceExposure, ServiceEndpoint};
+    use openshell_core::proto::{
+        GpuResourceRequirements, SandboxServiceExposure, ServiceAuthorizationMode, ServiceEndpoint,
+    };
+
+    #[tokio::test]
+    async fn missing_launch_signer_precedes_driver_validation_and_preserves_staged_archive() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = test_server_state().await;
+        let mut metadata = openshell_core::extension_protocol::extension_metadata(
+            openshell_core::extension_protocol::ExtensionFamily::Compute,
+            "test/launch-authentication",
+            "test",
+            [],
+        );
+        metadata
+            .required_capabilities
+            .push(openshell_core::extension_protocol::COMPUTE_LAUNCH_AUTHENTICATION.to_string());
+        let admission = openshell_core::resource_admission::DriverAdmissionConfig {
+            allow_driver_config: true,
+            ..Default::default()
+        };
+        let driver = Arc::new(
+            crate::test_support::FakeComputeDriver::new().with_capabilities(
+                openshell_core::proto::compute::v1::GetCapabilitiesResponse {
+                    driver_name: "test".to_string(),
+                    default_image: "test/image:latest".to_string(),
+                    rootfs_tar_staging_dir: directory.path().to_string_lossy().into_owned(),
+                    rootfs_tar_max_bytes: 1024,
+                    resource_admission_policy: admission.acknowledgement(),
+                    extension: Some(metadata),
+                    ..Default::default()
+                },
+            ),
+        );
+        let compute = crate::compute::ComputeRuntime::from_driver(
+            "test".to_string(),
+            driver.clone(),
+            None,
+            state.store.clone(),
+            crate::sandbox_index::SandboxIndex::new(),
+            crate::sandbox_watch::SandboxWatchBus::new(),
+            crate::tracing_bus::TracingLogBus::new(),
+            Arc::new(crate::supervisor_session::SupervisorSessionRegistry::new()),
+        )
+        .await
+        .unwrap()
+        .with_admission_policy(admission)
+        .unwrap();
+        Arc::get_mut(&mut state).unwrap().compute = compute;
+        let staging = state.compute.rootfs_tar_staging();
+        let slot = staging
+            .begin("default", "dev-user", "rootfs.tar", 7)
+            .unwrap();
+        std::fs::write(&slot.upload_path, b"archive").unwrap();
+        let driver_config = Struct {
+            fields: std::iter::once((
+                "test".to_string(),
+                Value {
+                    kind: Some(Kind::StructValue(Struct {
+                        fields: std::iter::once((
+                            crate::compute::rootfs_tar::STAGING_TOKEN_FIELD.to_string(),
+                            Value {
+                                kind: Some(Kind::StringValue(slot.token.clone())),
+                            },
+                        ))
+                        .collect(),
+                    })),
+                },
+            ))
+            .collect(),
+        };
+        driver.clear_calls();
+        let error = handle_create_sandbox(
+            &state,
+            authed_request(CreateSandboxRequest {
+                name: "missing-signer".to_string(),
+                spec: Some(SandboxSpec {
+                    template: Some(SandboxTemplate {
+                        driver_config: Some(driver_config),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("sandbox launch signing"));
+        assert!(
+            driver.calls().is_empty(),
+            "driver validation must not precede signing preflight"
+        );
+        assert_eq!(
+            staging.peek(&slot.token).unwrap(),
+            std::path::PathBuf::from(&slot.upload_path)
+        );
+        assert_eq!(std::fs::read(&slot.upload_path).unwrap(), b"archive");
+        assert!(
+            state
+                .store
+                .get_message_by_name::<Sandbox>("default", "missing-signer")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
 
     // ---- shell_escape ----
 
@@ -6720,10 +6847,12 @@ mod tests {
                     SandboxServiceExposure {
                         service: String::new(),
                         target_port: 4500,
+                        authorization_mode: ServiceAuthorizationMode::Unspecified as i32,
                     },
                     SandboxServiceExposure {
                         service: "metrics".to_string(),
                         target_port: 9090,
+                        authorization_mode: ServiceAuthorizationMode::BearerPassthrough as i32,
                     },
                 ],
                 ..Default::default()
@@ -6756,7 +6885,44 @@ mod tests {
             assert_eq!(endpoint.name, service);
             assert_eq!(endpoint.target_port, target_port);
             assert!(endpoint.domain);
+            let expected_mode = if service.is_empty() {
+                ServiceAuthorizationMode::Strip
+            } else {
+                ServiceAuthorizationMode::BearerPassthrough
+            };
+            assert_eq!(endpoint.authorization_mode(), expected_mode);
         }
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_rejects_unknown_service_authorization_mode_before_persisting() {
+        let state = test_server_state().await;
+        let error = handle_create_sandbox(
+            &state,
+            authed_request(CreateSandboxRequest {
+                name: "invalid-service-authorization".to_string(),
+                spec: Some(SandboxSpec::default()),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                service_exposures: vec![SandboxServiceExposure {
+                    service: String::new(),
+                    target_port: 4500,
+                    authorization_mode: 99,
+                }],
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect_err("unknown service authorization mode should be rejected");
+
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(
+            state
+                .store
+                .get_message_by_name::<Sandbox>("default", "invalid-service-authorization")
+                .await
+                .expect("sandbox lookup should succeed")
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -6788,10 +6954,12 @@ mod tests {
                     SandboxServiceExposure {
                         service: "web".to_string(),
                         target_port: 8080,
+                        authorization_mode: ServiceAuthorizationMode::Strip as i32,
                     },
                     SandboxServiceExposure {
                         service: "metrics".to_string(),
                         target_port: 9090,
+                        authorization_mode: ServiceAuthorizationMode::Strip as i32,
                     },
                 ],
                 ..Default::default()
@@ -6875,10 +7043,12 @@ mod tests {
                     SandboxServiceExposure {
                         service: "web".to_string(),
                         target_port: 8080,
+                        authorization_mode: ServiceAuthorizationMode::Strip as i32,
                     },
                     SandboxServiceExposure {
                         service: "web".to_string(),
                         target_port: 8081,
+                        authorization_mode: ServiceAuthorizationMode::Strip as i32,
                     },
                 ],
                 ..Default::default()
