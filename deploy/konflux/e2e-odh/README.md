@@ -2,8 +2,8 @@
 
 The downstream ODH Konflux e2e image is a separate test artifact. Its
 multi-stage UBI9 build compiles the CLI and a nextest archive from two
-independent Cargo lockfiles, with Rust, RPMs, and cluster tools prefetched by
-Hermeto for a network-isolated build. The runtime image carries the compiled
+independent Cargo lockfiles on the Red Hat rust-builder image, with crates,
+RPMs, and cluster tools prefetched by Hermeto for a network-isolated build. The runtime image carries the compiled
 archive, Cargo and nextest executables, cluster tools, the SSH client needed
 by sandbox lifecycle tests, and Git for repository workloads.
 

@@ -6,53 +6,58 @@
 # Gateway image for RHEL/Konflux (hermetic build).
 #
 # Multi-stage build that compiles openshell-gateway from source on UBI9.
-# Requires prefetched dependencies via Hermeto (cargo, rpm, generic).
-# cargo-auditable is a generic artifact so the gateway binary embeds crate
-# versions for image CVE scanners. See deploy/konflux/ for prefetch configs.
+# Requires prefetched dependencies via Hermeto (cargo, rpm). The Rust
+# toolchain comes from the Red Hat rust-builder image, since UBI9 ships
+# rust 1.92.0, below the workspace MSRV.
+# The image ships Rust 1.99.0, newer than the 1.95.0 that rust-toolchain.toml
+# pins and CI tests. The rust-rhel9 1.95.0 tag has not been rebuilt since
+# 2026-05-19, so pinning it would ship builds from a stale base.
+# cargo-auditable is cargo-prefetched from crates.io so the gateway binary
+# embeds crate versions for image CVE scanners. See deploy/konflux/cargo-auditable.
 #
 # Local build:  ./deploy/konflux/build-local.sh gateway
-
-ARG RUST_VERSION=1.95.0
 
 # ---------------------------------------------------------------------------
 # Build
 # ---------------------------------------------------------------------------
-FROM registry.access.redhat.com/ubi9/ubi:9.8@sha256:25a147defd01e19674714f55d17538c8dbe55d8c305fa157ecc3f9c8977b05b6 AS builder
+FROM registry.redhat.io/rust-builder-image/rust-rhel9:1.99.0@sha256:b00aaa63f7d6f5b857c170e4aed9d77f013f507ba97e72ebfcac48a7d3760310 AS builder
 
-ARG RUST_VERSION
-ARG TARGETARCH
+# The builder image runs as 1001; cargo install needs root. It already
+# ships gcc, gcc-c++, make, cmake, openssl-devel, clang-devel, git and
+# gcc-toolset-15, so no dnf step.
+USER 0
 
-RUN dnf install -y --nodocs --setopt=install_weak_deps=0 \
-        gcc gcc-c++ make cmake \
-        openssl-devel git-core clang-devel tar xz \
-        gcc-toolset-14 gcc-toolset-14-gcc-c++ \
-    && dnf clean all
-
-# UBI9 ships rust 1.92.0, below the workspace MSRV, so install the prefetched
-# upstream toolchain (GNU target) the same way the CLI and supervisor images do.
-RUN RUST_ARCH=$(case "${TARGETARCH}" in amd64) echo x86_64;; arm64) echo aarch64;; *) echo "${TARGETARCH}";; esac) && \
-    mkdir -p /tmp/rust-toolchain && \
-    tar xJf /cachi2/output/deps/generic/rust-${RUST_VERSION}-${RUST_ARCH}-unknown-linux-gnu.tar.xz -C /tmp/rust-toolchain --strip-components=1 && \
-    /tmp/rust-toolchain/install.sh --prefix=/usr/local && \
-    rm -rf /tmp/rust-toolchain
-
-# Prefetched cargo-auditable (mise.toml 0.7.5) embeds crate versions in the
-# binary so image CVE scanners can report Rust advisories.
-ARG CARGO_AUDITABLE_VERSION=0.7.5
-RUN RUST_ARCH=$(case "${TARGETARCH}" in amd64) echo x86_64;; arm64) echo aarch64;; *) echo "${TARGETARCH}";; esac) && \
-    tar xJf "/cachi2/output/deps/generic/cargo-auditable-${CARGO_AUDITABLE_VERSION}-${RUST_ARCH}-unknown-linux-gnu.tar.xz" -C /tmp && \
-    install -m 0755 "/tmp/cargo-auditable-${RUST_ARCH}-unknown-linux-gnu/cargo-auditable" /usr/local/bin/cargo-auditable && \
-    rm -rf "/tmp/cargo-auditable-${RUST_ARCH}-unknown-linux-gnu"
-
-# gcc-toolset-14 provides C++20 <format> header required by bundled Z3.
-# Same pattern as ~/git/builder (AIPCC-10154).
-ENV PATH=/opt/rh/gcc-toolset-14/root/usr/bin:${PATH} \
-    LD_LIBRARY_PATH=/opt/rh/gcc-toolset-14/root/usr/lib64:/opt/rh/gcc-toolset-14/root/usr/lib \
+# gcc-toolset-15 provides the C++20 <format> header required by bundled Z3.
+# The builder ships it because clang-libs requires it, and clang already
+# uses it as its GCC installation.
+ENV PATH=/opt/rh/gcc-toolset-15/root/usr/bin:${PATH} \
+    LD_LIBRARY_PATH=/opt/rh/gcc-toolset-15/root/usr/lib64:/opt/rh/gcc-toolset-15/root/usr/lib \
     CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
 
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY .cargo/ .cargo/
+
+# Install before the sources so application changes do not rebuild it.
+# The published lock's dev-dependencies are not vendored. Strip them and pin
+# the normal dependencies with the prefetch lock. Cargo reads source
+# replacement from the package directory, so copy the Hermeto config there.
+# Keep the version in lockstep
+# with deploy/konflux/cargo-auditable/Cargo.toml.
+ARG CARGO_AUDITABLE_VERSION=0.7.5
+COPY deploy/konflux/cargo-auditable/Cargo.lock /tmp/cargo-auditable-prefetch.lock
+RUN set -eu \
+    && cp -a "/cachi2/output/deps/cargo/cargo-auditable-${CARGO_AUDITABLE_VERSION}" /tmp/cargo-auditable \
+    && awk 'BEGIN { keep = 1 } /^\[dev-dependencies\./ { keep = 0 } keep' /tmp/cargo-auditable/Cargo.toml > /tmp/cargo-auditable/Cargo.toml.stripped \
+    && mv /tmp/cargo-auditable/Cargo.toml.stripped /tmp/cargo-auditable/Cargo.toml \
+    && grep -v -x 'resolver = "1"' /tmp/cargo-auditable/Cargo.toml > /tmp/cargo-auditable/Cargo.toml.resolver \
+    && mv /tmp/cargo-auditable/Cargo.toml.resolver /tmp/cargo-auditable/Cargo.toml \
+    && awk 'BEGIN { RS=""; ORS="\n\n" } /name = "konflux-prefetch-auditable"/ { next } /name = "cargo-auditable"/ { sub(/\nsource = "[^"]*"\n/, "\n"); sub(/\nchecksum = "[^"]*"\n/, "\n") } { print }' /tmp/cargo-auditable-prefetch.lock > /tmp/cargo-auditable/Cargo.lock \
+    && mkdir -p /tmp/cargo-auditable/.cargo \
+    && cp .cargo/config.toml /tmp/cargo-auditable/.cargo/config.toml \
+    && cargo install --offline --locked --path /tmp/cargo-auditable --root /usr/local \
+    && rm -rf /tmp/cargo-auditable /tmp/cargo-auditable-prefetch.lock
+
 COPY crates/ crates/
 COPY proto/ proto/
 COPY providers/ providers/

@@ -12,16 +12,11 @@ contentOrigin:
     - repoid: ubi-9-appstream-rpms
       baseurl: https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/$basearch/appstream/os/
 packages:
-  # Build stage (git-core is also installed in the runtime stage)
-  - gcc
-  - gcc-c++
-  - make
-  - cmake
-  - openssl-devel
+  # The build stage installs nothing: the rust-builder image ships rust,
+  # cargo, gcc, gcc-c++, make, cmake, openssl-devel, git and tar.
+  # Runtime stage
   - git-core
   - tar
-  - xz
-  # Runtime stage
   - ca-certificates
   - crypto-policies-scripts
   - python3.11

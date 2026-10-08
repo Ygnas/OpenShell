@@ -7,7 +7,8 @@
 #
 # Prerequisites:
 #   - hermeto and rpm (the RPM backend requires a Linux environment)
-#   - podman
+#   - podman, logged in to registry.redhat.io (`podman login registry.redhat.io`)
+#     to pull the rust-builder base image
 #
 # Usage:
 #   ./deploy/konflux/build-local.sh gateway
@@ -54,6 +55,7 @@ cleanup() {
         rm -f "${REPO_ROOT}/e2e/rust/.cargo/config.toml"
         rmdir "${REPO_ROOT}/e2e/rust/.cargo" 2>/dev/null || true
     fi
+    rm -rf "${REPO_ROOT}/deploy/konflux/cargo-auditable/.cargo"
     for p in "${CLEANUP_PATHS[@]}"; do
         rm -rf "$p"
     done
@@ -112,8 +114,8 @@ build_image() {
     if [[ -z "${prefetch_input}" ]]; then
         prefetch_input="[
             {\"path\": \".\", \"type\": \"cargo\"},
-            {\"path\": \"${konfig_dir}\", \"type\": \"rpm\"},
-            {\"path\": \"${konfig_dir}\", \"type\": \"generic\", \"lockfile\": \"generic-fetcher.yaml\"}
+            {\"path\": \"deploy/konflux/cargo-auditable\", \"type\": \"cargo\"},
+            {\"path\": \"${konfig_dir}\", \"type\": \"rpm\"}
         ]"
     fi
 
@@ -206,7 +208,7 @@ build_image() {
             --config-file /home/odh/openshell-e2e-odh/.config/nextest.toml \
             --profile e2e-odh --message-format json > /dev/null
     else
-        podman run --rm --platform "${PLATFORM}" "openshell-${component}-konflux" --help 2>&1 | head -3
+        podman run --rm --platform "${PLATFORM}" "openshell-${component}-konflux" --help 2>&1 | sed -n 1,3p
     fi
     echo ""
 }
