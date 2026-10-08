@@ -5,32 +5,30 @@
 
 # ODH Shift-Left e2e runner. Hermeto prefetches both Cargo lockfiles, RPMs,
 # and generic artifacts before this build runs without network access.
+# The Rust toolchain comes from the Red Hat rust-builder image.
+# The image ships Rust 1.99.0, newer than the 1.95.0 that rust-toolchain.toml
+# pins and CI tests. The rust-rhel9 1.95.0 tag has not been rebuilt since
+# 2026-05-19, so pinning it would ship builds from a stale base.
 # No RUN heredocs and no RUN --mount: build-local.sh injects the Hermeto
 # environment with awk. Every RUN must start at column 0 with `RUN ` and
 # use `&& \` continuations.
 
-ARG RUST_VERSION=1.95.0
 ARG OC_VERSION=4.20.0
 ARG HELM_VERSION=4.2.0
 ARG NEXTEST_VERSION=0.9.143
 
-FROM registry.access.redhat.com/ubi9/ubi:9.8@sha256:25a147defd01e19674714f55d17538c8dbe55d8c305fa157ecc3f9c8977b05b6 AS builder
+FROM registry.redhat.io/rust-builder-image/rust-rhel9:1.99.0@sha256:b00aaa63f7d6f5b857c170e4aed9d77f013f507ba97e72ebfcac48a7d3760310 AS builder
 
-ARG RUST_VERSION
+# The builder image runs as 1001 and already ships gcc, gcc-c++, make,
+# cmake, openssl-devel, git and tar, so no dnf step. Root writes /usr/local/bin.
+USER 0
+
 ARG NEXTEST_VERSION
 ARG TARGETARCH
 ARG OPENSHELL_VERSION=""
 
-RUN dnf install -y --nodocs --setopt=install_weak_deps=0 \
-        gcc gcc-c++ make cmake openssl-devel git-core tar xz \
-    && dnf clean all
-
 RUN RUST_ARCH=$(case "${TARGETARCH}" in amd64) echo x86_64;; arm64) echo aarch64;; *) exit 1;; esac) && \
     RUST_TRIPLE="${RUST_ARCH}-unknown-linux-gnu" && \
-    mkdir -p /tmp/rust-toolchain && \
-    tar xJf "/cachi2/output/deps/generic/rust-${RUST_VERSION}-${RUST_TRIPLE}.tar.xz" \
-        -C /tmp/rust-toolchain --strip-components=1 && \
-    /tmp/rust-toolchain/install.sh --prefix=/usr/local && \
     tar xzf "/cachi2/output/deps/generic/cargo-nextest-${NEXTEST_VERSION}-${RUST_TRIPLE}.tar.gz" \
         -C /usr/local/bin cargo-nextest
 
@@ -74,7 +72,7 @@ RUN dnf install -y --nodocs --setopt=install_weak_deps=0 \
     update-crypto-policies --set DEFAULT:PQ
 
 COPY --from=builder --chmod=0555 \
-    /usr/local/bin/cargo /usr/local/bin/cargo-nextest /usr/local/bin/
+    /usr/local/share/rust/bin/cargo /usr/local/bin/cargo-nextest /usr/local/bin/
 COPY --from=builder --chmod=0555 \
     /home/odh/openshell-e2e-odh/target/release/openshell /usr/local/bin/openshell
 COPY --from=builder /opt/openshell/e2e-odh.tar.zst /opt/openshell/e2e-odh.tar.zst
@@ -107,11 +105,14 @@ RUN install -d -o 1000 -g 1000 results .kube /home/odh/.config/openshell && \
     chown 1000:1000 /home/odh /home/odh/openshell-e2e-odh
 
 # Fail the build if an expected test runtime tool is absent. In particular,
-# sandbox connection uses ssh, and future repository tests need git.
+# sandbox connection uses ssh, and future repository tests need git. cargo
+# links the system libssl, libcrypto and libz, so run it once to catch a
+# missing library at build time.
 RUN for tool in bash oc kubectl helm openshell cargo cargo-nextest \
         python3.11 xsltproc script ssh git tar base64; do \
         command -v "${tool}" >/dev/null || { echo "missing e2e runtime tool: ${tool}" >&2; exit 1; }; \
-    done
+    done && \
+    cargo nextest --version >/dev/null
 
 ENV HOME=/home/odh \
     KUBECONFIG=/home/odh/openshell-e2e-odh/.kube/config \
